@@ -15,6 +15,8 @@
 #include <ctype.h>
 #include "server_commands.h"
 #include <ncurses.h>
+#include <sys/time.h>
+#include <time.h>
 
 #define NONCE_LEN crypto_secretbox_NONCEBYTES // 24
 #define MAC_LEN crypto_secretbox_MACBYTES // 16
@@ -33,6 +35,9 @@
 // for ncurses
 #define MAX_IN 512 // bufor wejściowy
 #define MSG_BUF 1024 // maks. długość wiadomości przychodzącej
+
+struct timeval ping_start;
+int waiting_for_pong = 0;
 
 // Sprawdza dane logowania z users.json
 int check_credentials(const char *login, const char *password) {
@@ -501,102 +506,109 @@ wrefresh(input_win);
 wrefresh(msg_win);
 
 while (1) {
-// --- 1) obsługa klawiszy użytkownika ---
-// ustawiamy timeout = 100 ms, żeby nie blokować wiecznie na wgetch
-wtimeout(input_win, 100);
-int ch = wgetch(input_win);
-if (ch != ERR) {
-if (ch == KEY_BACKSPACE || ch == 127 || ch == '\b') {
-if (in_len > 0) {
-in_len--;
-input_buf[in_len] = 0;
-}
-}
-else if (ch == '\n' || ch == '\r') {
-// ENTER: wyślij zaszyfrowaną wiadomość
-if (in_len > 0) {
-// szyfrowanie
-unsigned char nonce[NONCE_LEN];
-randombytes_buf(nonce, NONCE_LEN);
-unsigned char ctext[NONCE_LEN + MAX_PLAINTEXT + MAC_LEN];
-memcpy(ctext, nonce, NONCE_LEN);
-crypto_secretbox_easy(
-ctext + NONCE_LEN,
-(unsigned char*)input_buf,
-in_len,
-nonce,
-tx_key
-);
-uint16_t flen = PK_LEN + NONCE_LEN + in_len + MAC_LEN;
-unsigned char hdr[2] = { (uint8_t)(flen>>8), (uint8_t)flen };
+    // --- 1) obsługa klawiszy użytkownika ---
+    wtimeout(input_win, 100);
+    int ch = wgetch(input_win);
+    if (ch != ERR) {
+        if (ch == KEY_BACKSPACE || ch == 127 || ch == '\b') {
+            if (in_len > 0) {
+                in_len--;
+                input_buf[in_len] = 0;
+            }
+        }
+        else if (ch == '\n' || ch == '\r') {
+            if (in_len > 0) {
+                // jeśli wpisano "ping" lub "/ping" (bez względu na wielkość liter)
+                if (strcasecmp(input_buf, "ping") == 0 || strcasecmp(input_buf, "/ping") == 0) {
+                    gettimeofday(&ping_start, NULL);
+                    waiting_for_pong = 1;
+                }
 
-// wysyłamy: hdr, my_pk, ctext
-write_all(ser, hdr, 2);
-write_all(ser, my_pk, PK_LEN);
-write_all(ser, ctext, flen - PK_LEN);
+                // --- szyfrowanie i wysyłanie ---
+                unsigned char nonce[NONCE_LEN];
+                randombytes_buf(nonce, NONCE_LEN);
+                unsigned char ctext[NONCE_LEN + MAX_PLAINTEXT + MAC_LEN];
+                memcpy(ctext, nonce, NONCE_LEN);
+                crypto_secretbox_easy(
+                    ctext + NONCE_LEN,
+                    (unsigned char*)input_buf,
+                    in_len,
+                    nonce,
+                    tx_key
+                );
+                uint16_t flen = PK_LEN + NONCE_LEN + in_len + MAC_LEN;
+                unsigned char hdr[2] = { (uint8_t)(flen>>8), (uint8_t)flen };
 
-// wiadomość echa
-wprintw(msg_win, "[You] %s\n", input_buf);
-wrefresh(msg_win);
-}
-// wyczyść bufor i odśwież prompt
-in_len = 0;
-input_buf[0] = 0;
-}
-else if (isprint(ch) && in_len < MAX_IN-1) {
-input_buf[in_len++] = (char)ch;
-input_buf[in_len] = 0;
-}
-// odrysuj pasek wprowadzania
-werase(input_win);
-mvwprintw(input_win, 0, 0, "loracrypt-client> %s", input_buf);
-wrefresh(input_win);
-}
+                write_all(ser, hdr, 2);
+                write_all(ser, my_pk, PK_LEN);
+                write_all(ser, ctext, flen - PK_LEN);
 
-// --- 2) obsługa przychodzącej ramki z serwera ---
-fd_set rd;
-struct timeval tv = { 0, 0 };
-FD_ZERO(&rd);
-FD_SET(ser, &rd);
-if (select(ser+1, &rd, NULL, NULL, &tv) > 0 && FD_ISSET(ser, &rd)) {
-unsigned char hdr[2];
-if (read_all(ser, hdr, 2) != 2) break;
-uint16_t flen = (hdr[0]<<8) | hdr[1];
-if (flen < PK_LEN + NONCE_LEN + MAC_LEN || flen > MAX_FRAME) {
-// odrzucamy
-unsigned char trash[256];
-size_t togo = flen;
-while (togo) {
-size_t chunk = togo > sizeof(trash) ? sizeof(trash) : togo;
-read_all(ser, trash, chunk);
-togo -= chunk;
-}
-continue;
-}
-// czytamy PK (nieużywane, bo zakładamy tylko od serwera)
-unsigned char sender_pk[PK_LEN];
-read_all(ser, sender_pk, PK_LEN);
-unsigned char encbuf[MAX_FRAME];
-size_t enc_len = flen - PK_LEN;
-read_all(ser, encbuf, enc_len);
+                wprintw(msg_win, "[You] %s\n", input_buf);
+                wrefresh(msg_win);
+            }
+            in_len = 0;
+            input_buf[0] = 0;
+        }
+        else if (isprint(ch) && in_len < MAX_IN-1) {
+            input_buf[in_len++] = (char)ch;
+            input_buf[in_len] = 0;
+        }
+        werase(input_win);
+        mvwprintw(input_win, 0, 0, "loracrypt-client> %s", input_buf);
+        wrefresh(input_win);
+    }
 
-// odszyfrowanie
-unsigned char *nonce = encbuf;
-unsigned char *cipher = encbuf + NONCE_LEN;
-size_t clen = enc_len - NONCE_LEN;
-unsigned char plain[MAX_PLAINTEXT+1];
-if (crypto_secretbox_open_easy(plain, cipher, clen, nonce, rx_key) == 0) {
-// wypisz w msg_win
-plain[clen - MAC_LEN] = 0;
-wprintw(msg_win, "[Server] %s\n", plain);
-wrefresh(msg_win);
+    // --- 2) obsługa przychodzącej ramki z serwera ---
+    fd_set rd;
+    struct timeval tv = { 0, 0 };
+    FD_ZERO(&rd);
+    FD_SET(ser, &rd);
+    if (select(ser+1, &rd, NULL, NULL, &tv) > 0 && FD_ISSET(ser, &rd)) {
+        unsigned char hdr[2];
+        if (read_all(ser, hdr, 2) != 2) break;
+        uint16_t flen = (hdr[0]<<8) | hdr[1];
+        if (flen < PK_LEN + NONCE_LEN + MAC_LEN || flen > MAX_FRAME) {
+            unsigned char trash[256];
+            size_t togo = flen;
+            while (togo) {
+                size_t chunk = togo > sizeof(trash) ? sizeof(trash) : togo;
+                read_all(ser, trash, chunk);
+                togo -= chunk;
+            }
+            continue;
+        }
 
-// odśwież pasek wprowadzania nad aktualnym input_buf
-werase(input_win);
-mvwprintw(input_win, 0, 0, "loracrypt-client> %s", input_buf);
-wrefresh(input_win);
-}
-}
+        unsigned char sender_pk[PK_LEN];
+        read_all(ser, sender_pk, PK_LEN);
+        unsigned char encbuf[MAX_FRAME];
+        size_t enc_len = flen - PK_LEN;
+        read_all(ser, encbuf, enc_len);
+
+        unsigned char *nonce = encbuf;
+        unsigned char *cipher = encbuf + NONCE_LEN;
+        size_t clen = enc_len - NONCE_LEN;
+        unsigned char plain[MAX_PLAINTEXT+1];
+        if (crypto_secretbox_open_easy(plain, cipher, clen, nonce, rx_key) == 0) {
+            plain[clen - MAC_LEN] = 0;
+            wprintw(msg_win, "[Server] %s\n", plain);
+            wrefresh(msg_win);
+
+            // --- pomiar czasu dla PING ---
+        if (waiting_for_pong && strcasecmp((char*)plain, "pong") == 0) {
+            struct timeval ping_end;
+            gettimeofday(&ping_end, NULL);
+            long ms = (ping_end.tv_sec - ping_start.tv_sec) * 1000L +
+                    (ping_end.tv_usec - ping_start.tv_usec) / 1000L;
+            wprintw(msg_win, "[Info] RTT: %ld ms\n", ms);
+            wrefresh(msg_win);
+            waiting_for_pong = 0;
+        }
+
+            werase(input_win);
+            mvwprintw(input_win, 0, 0, "loracrypt-client> %s", input_buf);
+            wrefresh(input_win);
+        }
+    }
 }
 
 // --- sprzątanie ---
