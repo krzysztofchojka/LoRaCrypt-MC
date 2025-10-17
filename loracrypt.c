@@ -14,6 +14,7 @@
 #include <sodium.h>
 #include <ctype.h>
 #include "server_commands.h"
+#include <ncurses.h>
 
 #define NONCE_LEN crypto_secretbox_NONCEBYTES // 24
 #define MAC_LEN crypto_secretbox_MACBYTES // 16
@@ -28,6 +29,10 @@
 #define HELLO_LEN (sizeof(HELLO_MSG)-1)
 #define HANDSHAKE_HDR 0xFFFF
 #define MAX_CLIENTS 32
+
+// for ncurses
+#define MAX_IN 512 // bufor wejściowy
+#define MSG_BUF 1024 // maks. długość wiadomości przychodzącej
 
 // Sprawdza dane logowania z users.json
 int check_credentials(const char *login, const char *password) {
@@ -415,193 +420,189 @@ printf("loracrypt-server> "); fflush(stdout);
 int logged_in = 0;
 
 void interactive_loop_client(int ser,
-    unsigned char my_pk[PK_LEN], unsigned char my_sk[SK_LEN],
-    unsigned char server_pk[PK_LEN],
-    unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN]) {
-
-    fd_set rd;
-    char line[MAX_PLAINTEXT+1];
-    unsigned char buf[MAX_FRAME];
-
+unsigned char my_pk[PK_LEN], unsigned char my_sk[SK_LEN],
+unsigned char server_pk[PK_LEN],
+unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
+{
     if(!logged_in){
-    char login[64], password[64], credentials[128];
-    unsigned char nonce[NONCE_LEN];
-    unsigned char ctext[NONCE_LEN + 128 + MAC_LEN];
+        char login[64], password[64], credentials[128];
+        unsigned char nonce[NONCE_LEN];
+        unsigned char ctext[NONCE_LEN + 128 + MAC_LEN];
 
-    while (!logged_in) {
-        printf("Login: ");
-        fflush(stdout);
-        if (!fgets(login, sizeof(login), stdin)) exit(1);
-        login[strcspn(login, "\n")] = 0;
+        while (!logged_in) {
+            printf("Login: ");
+            fflush(stdout);
+            if (!fgets(login, sizeof(login), stdin)) exit(1);
+            login[strcspn(login, "\n")] = 0;
 
-        printf("Password: ");
-        fflush(stdout);
-        if (!fgets(password, sizeof(password), stdin)) exit(1);
-        password[strcspn(password, "\n")] = 0;
+            printf("Password: ");
+            fflush(stdout);
+            if (!fgets(password, sizeof(password), stdin)) exit(1);
+            password[strcspn(password, "\n")] = 0;
 
-        snprintf(credentials, sizeof(credentials), "LOGIN %s %s", login, password);
+            snprintf(credentials, sizeof(credentials), "LOGIN %s %s", login, password);
 
-        // szyfrowanie jak zwykle
-        randombytes_buf(nonce, NONCE_LEN);
-        memcpy(ctext, nonce, NONCE_LEN);
-        crypto_secretbox_easy(ctext + NONCE_LEN, (unsigned char*)credentials,
-                              strlen(credentials), nonce, tx_key);
+            randombytes_buf(nonce, NONCE_LEN);
+            memcpy(ctext, nonce, NONCE_LEN);
+            crypto_secretbox_easy(ctext + NONCE_LEN, (unsigned char*)credentials,
+                                  strlen(credentials), nonce, tx_key);
 
-        uint16_t flen = PK_LEN + NONCE_LEN + strlen(credentials) + MAC_LEN;
-        unsigned char hdr[2] = { (uint8_t)(flen >> 8), (uint8_t)flen };
+            uint16_t flen = PK_LEN + NONCE_LEN + strlen(credentials) + MAC_LEN;
+            unsigned char hdr[2] = { (uint8_t)(flen >> 8), (uint8_t)flen };
 
-        // wysyłka do serwera
-        if (write_all(ser, hdr, 2) != 2 ||
-            write_all(ser, my_pk, PK_LEN) != PK_LEN ||
-            write_all(ser, ctext, flen - PK_LEN) != flen - PK_LEN) {
-            fprintf(stderr, "Write failed during login\n");
-            exit(1);
-        }
+            if (write_all(ser, hdr, 2) != 2 ||
+                write_all(ser, my_pk, PK_LEN) != PK_LEN ||
+                write_all(ser, ctext, flen - PK_LEN) != flen - PK_LEN) {
+                fprintf(stderr, "Write failed during login\n");
+                exit(1);
+            }
 
-        // odbiór odpowiedzi
-        unsigned char hdr_in[2];
-        if (read_all(ser, hdr_in, 2) != 2) {
-            fprintf(stderr, "Serial closed during login\n");
-            exit(1);
-        }
-        uint16_t flen_in = ((uint16_t)hdr_in[0]<<8) | hdr_in[1];
-        if (flen_in > MAX_FRAME) {
-            fprintf(stderr, "Response too long\n");
-            exit(1);
-        }
+            // odbiór odpowiedzi
+            unsigned char hdr_in[2];
+            if (read_all(ser, hdr_in, 2) != 2) { fprintf(stderr, "Serial closed during login\n"); exit(1); }
+            uint16_t flen_in = ((uint16_t)hdr_in[0]<<8) | hdr_in[1];
+            unsigned char sender_pk[PK_LEN];
+            if (read_all(ser, sender_pk, PK_LEN) != PK_LEN) { fprintf(stderr, "Short read sender pk\n"); exit(1); }
+            unsigned char encbuf[MAX_FRAME];
+            if (read_all(ser, encbuf, flen_in - PK_LEN) != (ssize_t)(flen_in - PK_LEN)) { fprintf(stderr, "Short read login response\n"); exit(1); }
 
-        unsigned char sender_pk[PK_LEN];
-        if (read_all(ser, sender_pk, PK_LEN) != PK_LEN) {
-            fprintf(stderr, "Short read sender pk\n");
-            exit(1);
-        }
+            unsigned char *nonce_in = encbuf;
+            unsigned char *cipher_in = encbuf + NONCE_LEN;
+            size_t clen_in = flen_in - PK_LEN - NONCE_LEN;
+            unsigned char plain[MAX_PLAINTEXT + 1];
+            if (crypto_secretbox_open_easy(plain, cipher_in, clen_in, nonce_in, rx_key) != 0) { fprintf(stderr, "Login decrypt failed\n"); continue; }
 
-        unsigned char encbuf[MAX_FRAME];
-        if (read_all(ser, encbuf, flen_in - PK_LEN) != (ssize_t)(flen_in - PK_LEN)) {
-            fprintf(stderr, "Short read login response\n");
-            exit(1);
-        }
-
-        unsigned char *nonce_in = encbuf;
-        unsigned char *cipher_in = encbuf + NONCE_LEN;
-        size_t clen_in = flen_in - PK_LEN - NONCE_LEN;
-
-        unsigned char plain[MAX_PLAINTEXT + 1];
-        if (crypto_secretbox_open_easy(plain, cipher_in, clen_in, nonce_in, rx_key) != 0) {
-            fprintf(stderr, "Login decrypt failed\n");
-            continue;
-        }
-
-        plain[clen_in - MAC_LEN] = 0;
-        if (strcmp((char*)plain, "LOGIN OK") == 0) {
-            printf("✅ Zalogowano pomyślnie!\n");
-            logged_in = 1;
-        } else {
-            printf("❌ Logowanie nieudane: %s\n", plain);
+            plain[clen_in - MAC_LEN] = 0;
+            if (strcmp((char*)plain, "LOGIN OK") == 0) {
+                printf("✅ Zalogowano pomyślnie!\n");
+                logged_in = 1;
+            } else {
+                printf("❌ Logowanie nieudane: %s\n", plain);
+            }
         }
     }
+// --- inicjalizacja ncurses ---
+initscr();
+cbreak();
+noecho();
+keypad(stdscr, TRUE);
+// okno z historią (scrollok pozwala na scrollowanie gdy jest pełne)
+WINDOW *msg_win = newwin(LINES-1, COLS, 0, 0);
+WINDOW *input_win = newwin(1, COLS, LINES-1, 0);
+scrollok(msg_win, TRUE);
+
+// bufor wprowadzania
+char input_buf[MAX_IN] = {0};
+int in_len = 0;
+
+// prompt
+mvwprintw(input_win, 0, 0, "loracrypt-client> ");
+wrefresh(input_win);
+wrefresh(msg_win);
+
+while (1) {
+// --- 1) obsługa klawiszy użytkownika ---
+// ustawiamy timeout = 100 ms, żeby nie blokować wiecznie na wgetch
+wtimeout(input_win, 100);
+int ch = wgetch(input_win);
+if (ch != ERR) {
+if (ch == KEY_BACKSPACE || ch == 127 || ch == '\b') {
+if (in_len > 0) {
+in_len--;
+input_buf[in_len] = 0;
+}
+}
+else if (ch == '\n' || ch == '\r') {
+// ENTER: wyślij zaszyfrowaną wiadomość
+if (in_len > 0) {
+// szyfrowanie
+unsigned char nonce[NONCE_LEN];
+randombytes_buf(nonce, NONCE_LEN);
+unsigned char ctext[NONCE_LEN + MAX_PLAINTEXT + MAC_LEN];
+memcpy(ctext, nonce, NONCE_LEN);
+crypto_secretbox_easy(
+ctext + NONCE_LEN,
+(unsigned char*)input_buf,
+in_len,
+nonce,
+tx_key
+);
+uint16_t flen = PK_LEN + NONCE_LEN + in_len + MAC_LEN;
+unsigned char hdr[2] = { (uint8_t)(flen>>8), (uint8_t)flen };
+
+// wysyłamy: hdr, my_pk, ctext
+write_all(ser, hdr, 2);
+write_all(ser, my_pk, PK_LEN);
+write_all(ser, ctext, flen - PK_LEN);
+
+// wiadomość echa
+wprintw(msg_win, "[You] %s\n", input_buf);
+wrefresh(msg_win);
+}
+// wyczyść bufor i odśwież prompt
+in_len = 0;
+input_buf[0] = 0;
+}
+else if (isprint(ch) && in_len < MAX_IN-1) {
+input_buf[in_len++] = (char)ch;
+input_buf[in_len] = 0;
+}
+// odrysuj pasek wprowadzania
+werase(input_win);
+mvwprintw(input_win, 0, 0, "loracrypt-client> %s", input_buf);
+wrefresh(input_win);
 }
 
+// --- 2) obsługa przychodzącej ramki z serwera ---
+fd_set rd;
+struct timeval tv = { 0, 0 };
+FD_ZERO(&rd);
+FD_SET(ser, &rd);
+if (select(ser+1, &rd, NULL, NULL, &tv) > 0 && FD_ISSET(ser, &rd)) {
+unsigned char hdr[2];
+if (read_all(ser, hdr, 2) != 2) break;
+uint16_t flen = (hdr[0]<<8) | hdr[1];
+if (flen < PK_LEN + NONCE_LEN + MAC_LEN || flen > MAX_FRAME) {
+// odrzucamy
+unsigned char trash[256];
+size_t togo = flen;
+while (togo) {
+size_t chunk = togo > sizeof(trash) ? sizeof(trash) : togo;
+read_all(ser, trash, chunk);
+togo -= chunk;
+}
+continue;
+}
+// czytamy PK (nieużywane, bo zakładamy tylko od serwera)
+unsigned char sender_pk[PK_LEN];
+read_all(ser, sender_pk, PK_LEN);
+unsigned char encbuf[MAX_FRAME];
+size_t enc_len = flen - PK_LEN;
+read_all(ser, encbuf, enc_len);
 
-    printf("Client interactive. Type text and ENTER.\n");
-    printf("loracrypt-client> "); fflush(stdout);
+// odszyfrowanie
+unsigned char *nonce = encbuf;
+unsigned char *cipher = encbuf + NONCE_LEN;
+size_t clen = enc_len - NONCE_LEN;
+unsigned char plain[MAX_PLAINTEXT+1];
+if (crypto_secretbox_open_easy(plain, cipher, clen, nonce, rx_key) == 0) {
+// wypisz w msg_win
+plain[clen - MAC_LEN] = 0;
+wprintw(msg_win, "[Server] %s\n", plain);
+wrefresh(msg_win);
 
-    while (1) {
-        FD_ZERO(&rd);
-        FD_SET(STDIN_FILENO, &rd);
-        FD_SET(ser, &rd);
-        int maxfd = (ser > STDIN_FILENO ? ser : STDIN_FILENO) + 1;
-        if (select(maxfd, &rd, NULL, NULL, NULL) < 0) { perror("select"); exit(1); }
+// odśwież pasek wprowadzania nad aktualnym input_buf
+werase(input_win);
+mvwprintw(input_win, 0, 0, "loracrypt-client> %s", input_buf);
+wrefresh(input_win);
+}
+}
+}
 
-        // stdin -> wysyłka do serwera (do jego klucza, server role)
-        if (FD_ISSET(STDIN_FILENO, &rd)) {
-            if (!fgets(line, sizeof(line), stdin)) break;
-            size_t plen = strlen(line);
-            if (plen && line[plen-1]=='\n') line[--plen]=0;
-            if (plen > MAX_PLAINTEXT) {
-                fprintf(stderr, "Za długa wiadomość, max %d bajtów\n", MAX_PLAINTEXT);
-                printf("loracrypt-client> "); fflush(stdout);
-                continue;
-            }
-            unsigned char nonce[NONCE_LEN];
-            randombytes_buf(nonce, NONCE_LEN);
-            unsigned char ctext[NONCE_LEN + MAX_PLAINTEXT + MAC_LEN];
-            memcpy(ctext, nonce, NONCE_LEN);
-            crypto_secretbox_easy(ctext + NONCE_LEN, (unsigned char*)line, plen, nonce, tx_key);
-            uint16_t flen = PK_LEN + NONCE_LEN + plen + MAC_LEN;
-            unsigned char hdr[2] = { (uint8_t)(flen>>8), (uint8_t)flen };
-            // wysyłamy: hdr, my_pk, ctext (nonce + cipher)
-            if (write_all(ser, hdr, 2) != 2) { fprintf(stderr, "Write hdr failed\n"); break; }
-            if (write_all(ser, my_pk, PK_LEN) != PK_LEN) { fprintf(stderr, "Write pk failed\n"); break; }
-            if (write_all(ser, ctext, flen - PK_LEN) != flen - PK_LEN) { fprintf(stderr, "Write ctext failed\n"); break; }
-            printf("Sent encrypted: %s\n", line);
-            printf("loracrypt-client> "); fflush(stdout);
-        }
-
-        // odbiór
-        if (FD_ISSET(ser, &rd)) {
-            unsigned char hdr[2];
-            if (read_all(ser, hdr, 2) != 2) { fprintf(stderr, "Serial closed\n"); break; }
-            uint16_t flen = ((uint16_t)hdr[0]<<8) | hdr[1];
-            if (flen == HANDSHAKE_HDR) {
-                // to znaczy: ktoś próbuje handshake na linii — w trybie klienta możemy to zignorować lub odczytać i odrzucić
-                // ale protokół przewiduje, że klient nie powinien otrzymać HANDSHAKE_HDR. Odrzucamy dalsze dane
-                unsigned char trash[256];
-                size_t togo = 0;
-                // nic więcej do czytania w tej wersji - po prostu continue
-                continue;
-            }
-            if (flen == 0 || flen > MAX_FRAME) {
-                fprintf(stderr, "Frame too big (%u), discarding\n", flen);
-                size_t togo = flen;
-                unsigned char trash[128];
-                while (togo) {
-                    size_t chunk = togo > sizeof(trash) ? sizeof(trash) : togo;
-                    if (read_all(ser, trash, chunk) != (ssize_t)chunk) break;
-                    togo -= chunk;
-                }
-                printf("loracrypt-client> "); fflush(stdout);
-                continue;
-            }
-            if (flen < PK_LEN + NONCE_LEN + MAC_LEN) {
-                fprintf(stderr, "Frame too small for pk+crypto\n");
-                unsigned char trash[256];
-                size_t togo = flen;
-                while (togo) {
-                    size_t chunk = togo > sizeof(trash) ? sizeof(trash) : togo;
-                    if (read_all(ser, trash, chunk) != (ssize_t)chunk) break;
-                    togo -= chunk;
-                }
-                printf("loracrypt-client> "); fflush(stdout);
-                continue;
-            }
-            unsigned char sender_pk[PK_LEN];
-            if (read_all(ser, sender_pk, PK_LEN) != PK_LEN) { fprintf(stderr, "Short read sender pk\n"); break; }
-            unsigned char encbuf[MAX_FRAME];
-            size_t enc_len = flen - PK_LEN;
-            if (enc_len > sizeof(encbuf)) { fprintf(stderr, "enc_len too big\n"); break; }
-            if (read_all(ser, encbuf, enc_len) != (ssize_t)enc_len) { fprintf(stderr, "Short read enc payload\n"); break; }
-
-            // sprawdź, czy sender_pk zgadza się z serwerem, którego znamy
-            if (memcmp(sender_pk, server_pk, PK_LEN) != 0) {
-                fprintf(stderr, "Warning: message sender PK doesn't match server PK\n");
-                // ale spróbujemy odszyfrować nadal
-            }
-            unsigned char *nonce = encbuf;
-            unsigned char *cipher = encbuf + NONCE_LEN;
-            size_t clen = enc_len - NONCE_LEN;
-            unsigned char plain[MAX_PLAINTEXT+1];
-            if (crypto_secretbox_open_easy(plain, cipher, clen, nonce, rx_key) != 0) {
-                fprintf(stderr, "Decrypt failed (client)\n");
-                printf("loracrypt-client> "); fflush(stdout);
-                continue;
-            }
-            size_t plen2 = clen - MAC_LEN;
-            plain[plen2] = 0;
-            printf("\n[Decrypted] %s\n", (char*)plain);
-            printf("loracrypt-client> "); fflush(stdout);
-        }
-    }
+// --- sprzątanie ---
+delwin(msg_win);
+delwin(input_win);
+endwin();
 }
 
 int main(int argc, char *argv[]) {

@@ -8,4 +8,4 @@ BREW_PREFIX=$(brew --prefix)
 gcc loracrypt.c server_commands.cpp -o loracrypt \
     -I"$BREW_PREFIX/include" \
     -L"$BREW_PREFIX/lib" \
-    -lsodium -lpthread
+    -lsodium -lpthread -lncurses
