@@ -1,6 +1,6 @@
-// loralink_multi.c
+// loracrypt_multi.c
 // Multi-client LoRa+UART with libsodium
-// gcc loralink_multi.c -o loralink -lsodium
+// gcc loracrypt_multi.c -o loracrypt -lsodium
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,20 +12,43 @@
 #include <sys/select.h>
 #include <stdint.h>
 #include <sodium.h>
+#include <ctype.h>
+#include "server_commands.h"
 
 #define NONCE_LEN crypto_secretbox_NONCEBYTES // 24
 #define MAC_LEN crypto_secretbox_MACBYTES // 16
 #define KEY_LEN crypto_secretbox_KEYBYTES // 32
-#define PK_LEN crypto_kx_PUBLICKEYBYTES // 32
+//#define PK_LEN crypto_kx_PUBLICKEYBYTES // 32
 #define SK_LEN crypto_kx_SECRETKEYBYTES // 32
-#define SESSION_KEY_LEN crypto_kx_SESSIONKEYBYTES // 32
+//#define SESSION_KEY_LEN crypto_kx_SESSIONKEYBYTES // 32
 
 #define MAX_FRAME 240
-#define MAX_PLAINTEXT (MAX_FRAME - NONCE_LEN - MAC_LEN - PK_LEN)
+//#define MAX_PLAINTEXT (MAX_FRAME - NONCE_LEN - MAC_LEN - PK_LEN)
 #define HELLO_MSG "HELLO test123"
 #define HELLO_LEN (sizeof(HELLO_MSG)-1)
 #define HANDSHAKE_HDR 0xFFFF
 #define MAX_CLIENTS 32
+
+// Sprawdza dane logowania z users.json
+int check_credentials(const char *login, const char *password) {
+    FILE *f = fopen("users.json", "r");
+    if (!f) {
+        perror("users.json");
+        return 0;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char ulogin[64], upass[64];
+        if (sscanf(line, " { \"login\": \"%63[^\"]\", \"password\": \"%63[^\"]\"", ulogin, upass) == 2) {
+            if (strcmp(ulogin, login) == 0 && strcmp(upass, password) == 0) {
+                fclose(f);
+                return 1;
+            }
+        }
+    }
+    fclose(f);
+    return 0;
+}
 
 // Otwórz UART
 int open_serial(const char *dev) {
@@ -80,13 +103,7 @@ ssize_t write_all(int fd, const void *buf, size_t len) {
     return sent;
 }
 
-typedef struct {
-    unsigned char pk[PK_LEN];
-    unsigned char rx_key[SESSION_KEY_LEN]; // key for decrypting messages FROM client (server's rx)
-    unsigned char tx_key[SESSION_KEY_LEN]; // key for encrypting messages TO client (server's tx)
-} client_t;
-
-client_t clients[MAX_CLIENTS];
+struct client_t clients[MAX_CLIENTS];
 int client_count = 0;
 
 // Dodaj klienta (jeśli nie ma) i zwróć indeks lub -1
@@ -218,7 +235,7 @@ void interactive_loop_server(int ser, unsigned char server_pk[PK_LEN], unsigned 
     printf("  /sendall <text>\n");
     printf("  /send <idx> <text>\n");
     printf("Type text (default sends to client 0)\n");
-    printf("loralink-server> "); fflush(stdout);
+    printf("loracrypt-server> "); fflush(stdout);
 
     while (1) {
         FD_ZERO(&rd);
@@ -232,7 +249,7 @@ void interactive_loop_server(int ser, unsigned char server_pk[PK_LEN], unsigned 
             if (!fgets(line, sizeof(line), stdin)) break;
             size_t plen = strlen(line);
             if (plen && line[plen-1]=='\n') line[--plen]=0;
-            if (plen == 0) { printf("loralink-server> "); fflush(stdout); continue; }
+            if (plen == 0) { printf("loracrypt-server> "); fflush(stdout); continue; }
 
             if (strncmp(line, "/list", 5) == 0) {
                 printf("Clients (%d):\n", client_count);
@@ -241,7 +258,7 @@ void interactive_loop_server(int ser, unsigned char server_pk[PK_LEN], unsigned 
                     for (int j=0;j<PK_LEN;j++) printf("%02x", clients[i].pk[j]);
                     printf("\n");
                 }
-                printf("loralink-server> "); fflush(stdout);
+                printf("loracrypt-server> "); fflush(stdout);
                 continue;
             }
             if (strncmp(line, "/sendall ", 9) == 0) {
@@ -252,7 +269,7 @@ void interactive_loop_server(int ser, unsigned char server_pk[PK_LEN], unsigned 
                     }
                 }
                 printf("Sent to all (%d clients)\n", client_count);
-                printf("loralink-server> "); fflush(stdout);
+                printf("loracrypt-server> "); fflush(stdout);
                 continue;
             }
             if (strncmp(line, "/send ", 6) == 0) {
@@ -274,7 +291,7 @@ void interactive_loop_server(int ser, unsigned char server_pk[PK_LEN], unsigned 
                 } else {
                     printf("Usage: /send <idx> <text>\n");
                 }
-                printf("loralink-server> "); fflush(stdout);
+                printf("loracrypt-server> "); fflush(stdout);
                 continue;
             }
 
@@ -288,7 +305,7 @@ void interactive_loop_server(int ser, unsigned char server_pk[PK_LEN], unsigned 
             } else {
                 printf("No clients connected\n");
             }
-            printf("loralink-server> "); fflush(stdout);
+            printf("loracrypt-server> "); fflush(stdout);
         }
 
         // serial
@@ -304,7 +321,7 @@ void interactive_loop_server(int ser, unsigned char server_pk[PK_LEN], unsigned 
                 if (handle_handshake_on_server(ser, server_pk, server_sk) < 0) {
                     fprintf(stderr, "Handshake failed\n");
                 }
-                printf("loralink-server> "); fflush(stdout);
+                printf("loracrypt-server> "); fflush(stdout);
                 continue;
             }
             if (flen == 0 || flen > MAX_FRAME) {
@@ -316,7 +333,7 @@ void interactive_loop_server(int ser, unsigned char server_pk[PK_LEN], unsigned 
                     if (read_all(ser, trash, chunk) != (ssize_t)chunk) break;
                     togo -= chunk;
                 }
-                printf("loralink-server> "); fflush(stdout);
+                printf("loracrypt-server> "); fflush(stdout);
                 continue;
             }
             // normal message: first PK_LEN bytes = sender pk
@@ -330,7 +347,7 @@ void interactive_loop_server(int ser, unsigned char server_pk[PK_LEN], unsigned 
                     if (read_all(ser, trash, chunk) != (ssize_t)chunk) break;
                     togo -= chunk;
                 }
-                printf("loralink-server> "); fflush(stdout);
+                printf("loracrypt-server> "); fflush(stdout);
                 continue;
             }
             unsigned char sender_pk[PK_LEN];
@@ -347,7 +364,7 @@ void interactive_loop_server(int ser, unsigned char server_pk[PK_LEN], unsigned 
             int idx = find_client_by_pk(sender_pk);
             if (idx < 0) {
                 fprintf(stderr, "Unknown sender pk, ignoring (or run handshake?)\n");
-                printf("loralink-server> "); fflush(stdout);
+                printf("loracrypt-server> "); fflush(stdout);
                 continue;
             }
             unsigned char *nonce = buf;
@@ -356,16 +373,46 @@ void interactive_loop_server(int ser, unsigned char server_pk[PK_LEN], unsigned 
             unsigned char plain[MAX_PLAINTEXT+1];
             if (crypto_secretbox_open_easy(plain, cipher, clen, nonce, clients[idx].rx_key) != 0) {
                 fprintf(stderr, "Decrypt failed from client %d\n", idx);
-                printf("loralink-server> "); fflush(stdout);
+                printf("loracrypt-server> "); fflush(stdout);
                 continue;
             }
             size_t plen2 = clen - MAC_LEN;
             plain[plen2] = 0;
-            printf("\n[From client %d] %s\n", idx, (char*)plain);
-            printf("loralink-server> "); fflush(stdout);
+printf("\n[From client %d] %s\n", idx, (char*)plain);
+
+// jeśli klient jeszcze nie zalogowany
+if (!clients[idx].logged_in) {
+    if (strncmp((char*)plain, "LOGIN ", 6) == 0) {
+        char login[64], pass[64];
+        if (sscanf((char*)plain + 6, "%63s %63s", login, pass) == 2) {
+            if (check_credentials(login, pass)) {
+                clients[idx].logged_in = 1;
+                strncpy(clients[idx].username, login, sizeof(clients[idx].username)-1);
+                server_send_to_client(ser, server_pk, idx, (unsigned char*)"LOGIN OK", 8);
+                printf("Client %d logged in as %s\n", idx, login);
+            } else {
+                server_send_to_client(ser, server_pk, idx, (unsigned char*)"LOGIN FAIL", 10);
+                printf("Client %d failed login\n", idx);
+            }
+        } else {
+            server_send_to_client(ser, server_pk, idx, (unsigned char*)"BAD FORMAT", 10);
+        }
+    } else {
+        server_send_to_client(ser, server_pk, idx, (unsigned char*)"LOGIN REQUIRED", 14);
+        printf("Client %d tried to send before login\n", idx);
+    }
+    printf("loracrypt-server> "); fflush(stdout);
+    continue;
+}
+
+// tu dopiero normalna wiadomość jeśli logged_in==1
+handle_client_message(ser, server_pk, idx, plain, strlen((char*)plain));
+printf("loracrypt-server> "); fflush(stdout);
         }
     }
 }
+
+int logged_in = 0;
 
 void interactive_loop_client(int ser,
     unsigned char my_pk[PK_LEN], unsigned char my_sk[SK_LEN],
@@ -375,8 +422,89 @@ void interactive_loop_client(int ser,
     fd_set rd;
     char line[MAX_PLAINTEXT+1];
     unsigned char buf[MAX_FRAME];
+
+    if(!logged_in){
+    char login[64], password[64], credentials[128];
+    unsigned char nonce[NONCE_LEN];
+    unsigned char ctext[NONCE_LEN + 128 + MAC_LEN];
+
+    while (!logged_in) {
+        printf("Login: ");
+        fflush(stdout);
+        if (!fgets(login, sizeof(login), stdin)) exit(1);
+        login[strcspn(login, "\n")] = 0;
+
+        printf("Password: ");
+        fflush(stdout);
+        if (!fgets(password, sizeof(password), stdin)) exit(1);
+        password[strcspn(password, "\n")] = 0;
+
+        snprintf(credentials, sizeof(credentials), "LOGIN %s %s", login, password);
+
+        // szyfrowanie jak zwykle
+        randombytes_buf(nonce, NONCE_LEN);
+        memcpy(ctext, nonce, NONCE_LEN);
+        crypto_secretbox_easy(ctext + NONCE_LEN, (unsigned char*)credentials,
+                              strlen(credentials), nonce, tx_key);
+
+        uint16_t flen = PK_LEN + NONCE_LEN + strlen(credentials) + MAC_LEN;
+        unsigned char hdr[2] = { (uint8_t)(flen >> 8), (uint8_t)flen };
+
+        // wysyłka do serwera
+        if (write_all(ser, hdr, 2) != 2 ||
+            write_all(ser, my_pk, PK_LEN) != PK_LEN ||
+            write_all(ser, ctext, flen - PK_LEN) != flen - PK_LEN) {
+            fprintf(stderr, "Write failed during login\n");
+            exit(1);
+        }
+
+        // odbiór odpowiedzi
+        unsigned char hdr_in[2];
+        if (read_all(ser, hdr_in, 2) != 2) {
+            fprintf(stderr, "Serial closed during login\n");
+            exit(1);
+        }
+        uint16_t flen_in = ((uint16_t)hdr_in[0]<<8) | hdr_in[1];
+        if (flen_in > MAX_FRAME) {
+            fprintf(stderr, "Response too long\n");
+            exit(1);
+        }
+
+        unsigned char sender_pk[PK_LEN];
+        if (read_all(ser, sender_pk, PK_LEN) != PK_LEN) {
+            fprintf(stderr, "Short read sender pk\n");
+            exit(1);
+        }
+
+        unsigned char encbuf[MAX_FRAME];
+        if (read_all(ser, encbuf, flen_in - PK_LEN) != (ssize_t)(flen_in - PK_LEN)) {
+            fprintf(stderr, "Short read login response\n");
+            exit(1);
+        }
+
+        unsigned char *nonce_in = encbuf;
+        unsigned char *cipher_in = encbuf + NONCE_LEN;
+        size_t clen_in = flen_in - PK_LEN - NONCE_LEN;
+
+        unsigned char plain[MAX_PLAINTEXT + 1];
+        if (crypto_secretbox_open_easy(plain, cipher_in, clen_in, nonce_in, rx_key) != 0) {
+            fprintf(stderr, "Login decrypt failed\n");
+            continue;
+        }
+
+        plain[clen_in - MAC_LEN] = 0;
+        if (strcmp((char*)plain, "LOGIN OK") == 0) {
+            printf("✅ Zalogowano pomyślnie!\n");
+            logged_in = 1;
+        } else {
+            printf("❌ Logowanie nieudane: %s\n", plain);
+        }
+    }
+}
+
+
     printf("Client interactive. Type text and ENTER.\n");
-    printf("loralink-client> "); fflush(stdout);
+    printf("loracrypt-client> "); fflush(stdout);
 
     while (1) {
         FD_ZERO(&rd);
@@ -392,7 +520,7 @@ void interactive_loop_client(int ser,
             if (plen && line[plen-1]=='\n') line[--plen]=0;
             if (plen > MAX_PLAINTEXT) {
                 fprintf(stderr, "Za długa wiadomość, max %d bajtów\n", MAX_PLAINTEXT);
-                printf("loralink-client> "); fflush(stdout);
+                printf("loracrypt-client> "); fflush(stdout);
                 continue;
             }
             unsigned char nonce[NONCE_LEN];
@@ -407,7 +535,7 @@ void interactive_loop_client(int ser,
             if (write_all(ser, my_pk, PK_LEN) != PK_LEN) { fprintf(stderr, "Write pk failed\n"); break; }
             if (write_all(ser, ctext, flen - PK_LEN) != flen - PK_LEN) { fprintf(stderr, "Write ctext failed\n"); break; }
             printf("Sent encrypted: %s\n", line);
-            printf("loralink-client> "); fflush(stdout);
+            printf("loracrypt-client> "); fflush(stdout);
         }
 
         // odbiór
@@ -432,7 +560,7 @@ void interactive_loop_client(int ser,
                     if (read_all(ser, trash, chunk) != (ssize_t)chunk) break;
                     togo -= chunk;
                 }
-                printf("loralink-client> "); fflush(stdout);
+                printf("loracrypt-client> "); fflush(stdout);
                 continue;
             }
             if (flen < PK_LEN + NONCE_LEN + MAC_LEN) {
@@ -444,7 +572,7 @@ void interactive_loop_client(int ser,
                     if (read_all(ser, trash, chunk) != (ssize_t)chunk) break;
                     togo -= chunk;
                 }
-                printf("loralink-client> "); fflush(stdout);
+                printf("loracrypt-client> "); fflush(stdout);
                 continue;
             }
             unsigned char sender_pk[PK_LEN];
@@ -465,13 +593,13 @@ void interactive_loop_client(int ser,
             unsigned char plain[MAX_PLAINTEXT+1];
             if (crypto_secretbox_open_easy(plain, cipher, clen, nonce, rx_key) != 0) {
                 fprintf(stderr, "Decrypt failed (client)\n");
-                printf("loralink-client> "); fflush(stdout);
+                printf("loracrypt-client> "); fflush(stdout);
                 continue;
             }
             size_t plen2 = clen - MAC_LEN;
             plain[plen2] = 0;
             printf("\n[Decrypted] %s\n", (char*)plain);
-            printf("loralink-client> "); fflush(stdout);
+            printf("loracrypt-client> "); fflush(stdout);
         }
     }
 }
