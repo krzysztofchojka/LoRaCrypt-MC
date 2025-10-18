@@ -33,6 +33,8 @@
 #define MAX_CLIENTS 32
 #define BAUDRATE B115200
 
+#define MAX_HISTORY 100
+
 // for ncurses
 #define MAX_IN 512 // bufor wejściowy
 #define MSG_BUF 1024 // maks. długość wiadomości przychodzącej
@@ -526,76 +528,125 @@ initscr();
 cbreak();
 noecho();
 keypad(stdscr, TRUE);
-// okno z historią (scrollok pozwala na scrollowanie gdy jest pełne)
+
 WINDOW *msg_win = newwin(LINES-1, COLS, 0, 0);
 WINDOW *input_win = newwin(1, COLS, LINES-1, 0);
+keypad(input_win, TRUE);
 scrollok(msg_win, TRUE);
 
 // bufor wprowadzania
 char input_buf[MAX_IN] = {0};
 int in_len = 0;
-int first_print=1;
+int first_print = 1;
+
+// <<< HISTORY >>>
+char *history[MAX_HISTORY] = {0};
+int history_count = 0;
+int history_pos = -1; // -1 = aktualny wpis, 0..history_count-1 = pozycje w historii
+
 // prompt
 mvwprintw(input_win, 0, 0, "loracrypt-client> ");
 wrefresh(input_win);
 wrefresh(msg_win);
 
 while (1) {
-    // --- 1) obsługa klawiszy użytkownika ---
-    wtimeout(input_win, 100);
-    int ch = wgetch(input_win);
-    if (ch != ERR) {
-        if (ch == KEY_BACKSPACE || ch == 127 || ch == '\b') {
-            if (in_len > 0) {
-                in_len--;
-                input_buf[in_len] = 0;
-            }
-        }
-        else if (ch == '\n' || ch == '\r') {
-            if (in_len > 0) {
-                // jeśli wpisano "ping" lub "/ping" (bez względu na wielkość liter)
-                char* trimmed = trim(input_buf);
-                if (strncasecmp(trimmed, "ping", 4) == 0 || strncasecmp(trimmed, "/ping", 5) == 0) {
-                    gettimeofday(&ping_start, NULL);
-                    waiting_for_pong = 1;
-                }
-                // --- szyfrowanie i wysyłanie ---
-                unsigned char nonce[NONCE_LEN];
-                randombytes_buf(nonce, NONCE_LEN);
-                unsigned char ctext[NONCE_LEN + MAX_PLAINTEXT + MAC_LEN];
-                memcpy(ctext, nonce, NONCE_LEN);
-                crypto_secretbox_easy(
-                    ctext + NONCE_LEN,
-                    (unsigned char*)input_buf,
-                    in_len,
-                    nonce,
-                    tx_key
-                );
-                uint16_t flen = PK_LEN + NONCE_LEN + in_len + MAC_LEN;
-                unsigned char hdr[2] = { (uint8_t)(flen>>8), (uint8_t)flen };
+// --- 1) obsługa klawiszy użytkownika ---
+wtimeout(input_win, 100);
+int ch = wgetch(input_win);
+if (ch != ERR) {
+if (ch == KEY_UP) {
+// <<< HISTORY: w górę >>>
+if (history_count > 0) {
+if (history_pos < 0)
+history_pos = history_count - 1;
+else if (history_pos > 0)
+history_pos--;
+// wczytaj z historii
+strncpy(input_buf, history[history_pos], MAX_IN - 1);
+in_len = strlen(input_buf);
+}
+}
+else if (ch == KEY_DOWN) {
+// <<< HISTORY: w dół >>>
+if (history_count > 0 && history_pos >= 0) {
+history_pos++;
+if (history_pos >= history_count) {
+// powrót do pustego bufora
+history_pos = -1;
+in_len = 0;
+input_buf[0] = 0;
+} else {
+strncpy(input_buf, history[history_pos], MAX_IN - 1);
+in_len = strlen(input_buf);
+}
+}
+}
+else if (ch == KEY_BACKSPACE || ch == 127 || ch == '\b') {
+if (in_len > 0) {
+in_len--;
+input_buf[in_len] = 0;
+}
+history_pos = -1;
+}
+else if (ch == '\n' || ch == '\r') {
+if (in_len > 0) {
+// <<< HISTORY: dodaj do historii >>>
+if (history_count < MAX_HISTORY) {
+history[history_count++] = strdup(input_buf);
+} else {
+// usuwamy najstarszą
+free(history[0]);
+memmove(history, history+1, sizeof(char*) * (MAX_HISTORY-1));
+history[MAX_HISTORY-1] = strdup(input_buf);
+}
+history_pos = -1;
 
-                write_all(ser, hdr, 2);
-                write_all(ser, my_pk, PK_LEN);
-                write_all(ser, ctext, flen - PK_LEN);
-                if(first_print){
-                    wprintw(msg_win, "[You] %s\n", input_buf);
-                    first_print=0;
-                }
-                else
-                    wprintw(msg_win, "\n\n[You] %s\n", input_buf);
-                wrefresh(msg_win);
-            }
-            in_len = 0;
-            input_buf[0] = 0;
-        }
-        else if (isprint(ch) && in_len < MAX_IN-1) {
-            input_buf[in_len++] = (char)ch;
-            input_buf[in_len] = 0;
-        }
-        werase(input_win);
-        mvwprintw(input_win, 0, 0, "loracrypt-client> %s", input_buf);
-        wrefresh(input_win);
-    }
+// opcjonalny ping
+char* trimmed = trim(input_buf);
+if (strncasecmp(trimmed, "ping", 4)==0 || strncasecmp(trimmed, "/ping",5)==0) {
+gettimeofday(&ping_start, NULL);
+waiting_for_pong = 1;
+}
+
+// szyfrowanie i wysyłanie
+unsigned char nonce[NONCE_LEN];
+randombytes_buf(nonce, NONCE_LEN);
+unsigned char ctext[NONCE_LEN + MAX_PLAINTEXT + MAC_LEN];
+memcpy(ctext, nonce, NONCE_LEN);
+crypto_secretbox_easy(ctext + NONCE_LEN,
+(unsigned char*)input_buf,
+in_len,
+nonce,
+tx_key);
+uint16_t flen = PK_LEN + NONCE_LEN + in_len + MAC_LEN;
+unsigned char hdr[2] = { (uint8_t)(flen>>8), (uint8_t)flen };
+
+write_all(ser, hdr, 2);
+write_all(ser, my_pk, PK_LEN);
+write_all(ser, ctext, flen - PK_LEN);
+
+if (first_print) {
+wprintw(msg_win, "[You] %s\n", input_buf);
+first_print = 0;
+} else {
+wprintw(msg_win, "\n\n[You] %s\n", input_buf);
+}
+wrefresh(msg_win);
+}
+// wyczyść bufor po Enterze
+in_len = 0;
+input_buf[0] = 0;
+}
+else if (isprint(ch) && in_len < MAX_IN-1) {
+input_buf[in_len++] = (char)ch;
+input_buf[in_len] = 0;
+history_pos = -1;
+}
+// odśwież input window
+werase(input_win);
+mvwprintw(input_win, 0, 0, "loracrypt-client> %s", input_buf);
+wrefresh(input_win);
+}
 
     // --- 2) obsługa przychodzącej ramki z serwera ---
     fd_set rd;
@@ -654,6 +705,8 @@ while (1) {
 }
 
 // --- sprzątanie ---
+for (int i = 0; i < history_count; i++)
+free(history[i]);
 delwin(msg_win);
 delwin(input_win);
 endwin();
