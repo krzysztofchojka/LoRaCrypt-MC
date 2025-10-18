@@ -31,6 +31,7 @@
 #define HELLO_LEN (sizeof(HELLO_MSG)-1)
 #define HANDSHAKE_HDR 0xFFFF
 #define MAX_CLIENTS 32
+#define BAUDRATE B115200
 
 // for ncurses
 #define MAX_IN 512 // bufor wejściowy
@@ -60,6 +61,16 @@ int check_credentials(const char *login, const char *password) {
     return 0;
 }
 
+// funkcja trim: usuwa spacje z początku i końca
+char* trim(char* str) {
+    while(*str && isspace(*str)) str++;      // usuń spacje z przodu
+    if(*str == 0) return str;
+    char* end = str + strlen(str) - 1;
+    while(end > str && isspace(*end)) end--; // usuń spacje z tyłu
+    *(end+1) = 0;
+    return str;
+}
+
 // Otwórz UART
 int open_serial(const char *dev) {
     int fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
@@ -70,8 +81,8 @@ int open_serial(const char *dev) {
     struct termios tio;
     tcgetattr(fd, &tio);
     cfmakeraw(&tio);
-    cfsetispeed(&tio, B115200);
-    cfsetospeed(&tio, B115200);
+    cfsetispeed(&tio, BAUDRATE);
+    cfsetospeed(&tio, BAUDRATE);
     tio.c_cflag |= CLOCAL | CREAD;
     tio.c_cflag &= ~CRTSCTS;
     tcsetattr(fd, TCSANOW, &tio);
@@ -151,23 +162,47 @@ int find_client_by_pk(const unsigned char pk[PK_LEN]) {
 int server_send_to_client(int serfd, const unsigned char server_pk[PK_LEN], int client_idx,
                           const unsigned char *plain, size_t plen) {
     if (client_idx < 0 || client_idx >= client_count) return -1;
+    printf("'nHERE1\n");
     if (plen > MAX_PLAINTEXT) return -1;
-
+printf("'nHERE2\n");
     unsigned char nonce[NONCE_LEN];
     randombytes_buf(nonce, NONCE_LEN);
-
+printf("'nHERE3\n");
     unsigned char ctext[NONCE_LEN + MAX_PLAINTEXT + MAC_LEN];
     memcpy(ctext, nonce, NONCE_LEN);
     crypto_secretbox_easy(ctext + NONCE_LEN, plain, plen, nonce, clients[client_idx].tx_key);
-
+printf("'nHERE4\n");
     uint16_t flen = PK_LEN + NONCE_LEN + plen + MAC_LEN;
     unsigned char hdr[2] = { (uint8_t)(flen>>8), (uint8_t)flen };
-
-    if (write_all(serfd, hdr, 2) != 2) return -1;
-    if (write_all(serfd, server_pk, PK_LEN) != PK_LEN) return -1;
-    if (write_all(serfd, ctext, flen - PK_LEN) != flen - PK_LEN) return -1;
+printf("'nHERE5\n");
+    if (write_all(serfd, hdr, 2) != 2) return -1;printf("'nHERE6\n");
+    if (write_all(serfd, server_pk, PK_LEN) != PK_LEN) return -1;printf("'nHERE7\n");
+    if (write_all(serfd, ctext, flen - PK_LEN) != flen - PK_LEN) return -1;printf("'nHERE8\n");
     return 0;
 }
+
+int server_xsend_to_client(int serfd, const unsigned char server_pk[PK_LEN],
+                           int client_idx, const unsigned char *plain, size_t plen) {
+    size_t offset = 0;
+
+    while (offset < plen) {
+        // Determine how much to send in this chunk
+        size_t chunk_size = plen - offset;
+        if (chunk_size > MAX_PLAINTEXT) {
+            chunk_size = MAX_PLAINTEXT;
+        }
+
+        // Send the chunk
+        printf("\n===> Sending chunk %lu/%lu <===\n", offset, plen);
+        server_send_to_client(serfd, server_pk, client_idx, plain + offset, chunk_size);
+
+        offset += chunk_size; // Move to the next chunk
+    }
+
+    return 0; // success
+}
+
+
 
 // HANDSHAKE (klient) - zmienione: używa HANDSHAKE_HDR
 void handshake_client(int ser,
@@ -499,7 +534,7 @@ scrollok(msg_win, TRUE);
 // bufor wprowadzania
 char input_buf[MAX_IN] = {0};
 int in_len = 0;
-
+int first_print=1;
 // prompt
 mvwprintw(input_win, 0, 0, "loracrypt-client> ");
 wrefresh(input_win);
@@ -519,11 +554,11 @@ while (1) {
         else if (ch == '\n' || ch == '\r') {
             if (in_len > 0) {
                 // jeśli wpisano "ping" lub "/ping" (bez względu na wielkość liter)
-                if (strcasecmp(input_buf, "ping") == 0 || strcasecmp(input_buf, "/ping") == 0) {
+                char* trimmed = trim(input_buf);
+                if (strncasecmp(trimmed, "ping", 4) == 0 || strncasecmp(trimmed, "/ping", 5) == 0) {
                     gettimeofday(&ping_start, NULL);
                     waiting_for_pong = 1;
                 }
-
                 // --- szyfrowanie i wysyłanie ---
                 unsigned char nonce[NONCE_LEN];
                 randombytes_buf(nonce, NONCE_LEN);
@@ -542,8 +577,12 @@ while (1) {
                 write_all(ser, hdr, 2);
                 write_all(ser, my_pk, PK_LEN);
                 write_all(ser, ctext, flen - PK_LEN);
-
-                wprintw(msg_win, "[You] %s\n", input_buf);
+                if(first_print){
+                    wprintw(msg_win, "[You] %s\n", input_buf);
+                    first_print=0;
+                }
+                else
+                    wprintw(msg_win, "\n\n[You] %s\n", input_buf);
                 wrefresh(msg_win);
             }
             in_len = 0;
@@ -590,8 +629,8 @@ while (1) {
         unsigned char plain[MAX_PLAINTEXT+1];
         if (crypto_secretbox_open_easy(plain, cipher, clen, nonce, rx_key) == 0) {
             plain[clen - MAC_LEN] = 0;
-            wprintw(msg_win, "[Server] %s\n", plain);
-            wrefresh(msg_win);
+            //wprintw(msg_win, "[Server] %s\n", plain);
+            
 
             // --- pomiar czasu dla PING ---
         if (waiting_for_pong && strcasecmp((char*)plain, "pong") == 0) {
@@ -599,9 +638,12 @@ while (1) {
             gettimeofday(&ping_end, NULL);
             long ms = (ping_end.tv_sec - ping_start.tv_sec) * 1000L +
                     (ping_end.tv_usec - ping_start.tv_usec) / 1000L;
-            wprintw(msg_win, "[Info] RTT: %ld ms\n", ms);
+            wprintw(msg_win, "Server responded \"%s\" RTT=%ld ms", plain, ms);
             wrefresh(msg_win);
             waiting_for_pong = 0;
+        }else{
+            wprintw(msg_win, "%s", plain);
+            wrefresh(msg_win);
         }
 
             werase(input_win);

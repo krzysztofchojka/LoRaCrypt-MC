@@ -8,7 +8,7 @@ extern "C" {
 
 #define PK_LEN 32
 #define SESSION_KEY_LEN 32
-#define MAX_PLAINTEXT 192
+#define MAX_PLAINTEXT (MAX_FRAME - NONCE_LEN - MAC_LEN - PK_LEN)
 
 // deklaracja struktury klienta
 struct client_t {
@@ -25,6 +25,8 @@ extern struct client_t clients[];
 
 // deklaracja funkcji z loracrypt.c
 int server_send_to_client(int serfd, const unsigned char server_pk[PK_LEN], int client_idx,
+                          const unsigned char *plain, size_t plen);
+int server_xsend_to_client(int serfd, const unsigned char server_pk[PK_LEN], int client_idx,
                           const unsigned char *plain, size_t plen);
 
 // Typ funkcji komendy
