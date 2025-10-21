@@ -693,7 +693,7 @@ void process_client_buffer(unsigned char *buffer, size_t *buffer_len,
         
         // Krok 2: Sprawdź, czy pakiet to nie śmieć (np. zły handshake)
         if (flen == HANDSHAKE_HDR) {
-             fprintf(stderr, "Unexpected handshake received, discarding\n");
+             //fprintf(stderr, "Unexpected handshake received, discarding\n");
              // Usuń śmieci z bufora
              size_t handshake_len = 2 + HELLO_LEN + PK_LEN;
              if (*buffer_len >= handshake_len) {
@@ -805,6 +805,12 @@ unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
 
             uint16_t flen = PK_LEN + NONCE_LEN + strlen(credentials) + MAC_LEN;
             unsigned char hdr[2] = { (uint8_t)(flen >> 8), (uint8_t)flen };
+
+            // *** DODAJ TĘ LINIĘ TUTAJ ***
+            // Wyczyść bufor wejściowy (Input) ze wszystkich "śmieci" LoRa
+            // zanim wyślemy żądanie i zaczniemy czekać na odpowiedź.
+            tcflush(ser, TCIFLUSH); 
+            // ***************************
 
             if (write_all(ser, hdr, 2) != 2 ||
                 write_all(ser, my_pk, PK_LEN) != PK_LEN ||
