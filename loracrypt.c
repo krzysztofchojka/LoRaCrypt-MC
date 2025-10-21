@@ -164,22 +164,17 @@ int find_client_by_pk(const unsigned char pk[PK_LEN]) {
 int server_send_to_client(int serfd, const unsigned char server_pk[PK_LEN], int client_idx,
                           const unsigned char *plain, size_t plen) {
     if (client_idx < 0 || client_idx >= client_count) return -1;
-    printf("'nHERE1\n");
     if (plen > MAX_PLAINTEXT) return -1;
-printf("'nHERE2\n");
     unsigned char nonce[NONCE_LEN];
     randombytes_buf(nonce, NONCE_LEN);
-printf("'nHERE3\n");
     unsigned char ctext[NONCE_LEN + MAX_PLAINTEXT + MAC_LEN];
     memcpy(ctext, nonce, NONCE_LEN);
     crypto_secretbox_easy(ctext + NONCE_LEN, plain, plen, nonce, clients[client_idx].tx_key);
-printf("'nHERE4\n");
     uint16_t flen = PK_LEN + NONCE_LEN + plen + MAC_LEN;
     unsigned char hdr[2] = { (uint8_t)(flen>>8), (uint8_t)flen };
-printf("'nHERE5\n");
-    if (write_all(serfd, hdr, 2) != 2) return -1;printf("'nHERE6\n");
-    if (write_all(serfd, server_pk, PK_LEN) != PK_LEN) return -1;printf("'nHERE7\n");
-    if (write_all(serfd, ctext, flen - PK_LEN) != flen - PK_LEN) return -1;printf("'nHERE8\n");
+    if (write_all(serfd, hdr, 2) != 2) return -1;
+    if (write_all(serfd, server_pk, PK_LEN) != PK_LEN) return -1;
+    if (write_all(serfd, ctext, flen - PK_LEN) != flen - PK_LEN) return -1;
     return 0;
 }
 
@@ -195,7 +190,7 @@ int server_xsend_to_client(int serfd, const unsigned char server_pk[PK_LEN],
         }
 
         // Send the chunk
-        printf("\n===> Sending chunk %lu/%lu <===\n", offset, plen);
+        //printf("\n===> Sending chunk %lu/%lu <===\n", offset, plen);
         server_send_to_client(serfd, server_pk, client_idx, plain + offset, chunk_size);
 
         offset += chunk_size; // Move to the next chunk
@@ -308,13 +303,13 @@ void interactive_loop_server(int ser, unsigned char server_pk[PK_LEN], unsigned 
                 printf("loracrypt-server> "); fflush(stdout);
                 continue;
             }
+            
             if (strncmp(line, "/sendall ", 9) == 0) {
                 const char *msg = line + 9;
-                for (int i=0;i<client_count;i++) {
-                    if (server_send_to_client(ser, server_pk, i, (const unsigned char*)msg, strlen(msg)) != 0) {
-                        fprintf(stderr, "Failed to send to client %d\n", i);
-                    }
-                }
+                
+                // ZMIANA: Użyj nowej funkcji send_to_all, podając -1 jako ID serwera
+                send_to_all(ser, server_pk, -1, (const unsigned char*)msg, strlen(msg));
+                
                 printf("Sent to all (%d clients)\n", client_count);
                 printf("loracrypt-server> "); fflush(stdout);
                 continue;
@@ -327,7 +322,13 @@ void interactive_loop_server(int ser, unsigned char server_pk[PK_LEN], unsigned 
                     const char *msg = line + 6 + consumed;
                     while (*msg == ' ') msg++;
                     if (idx >= 0 && idx < client_count && *msg) {
-                        if (server_send_to_client(ser, server_pk, idx, (const unsigned char*)msg, strlen(msg)) == 0) {
+                        
+                        // ZMIANA: Sformatuj wiadomość z nadawcą "Server"
+                        char formatted_msg[MSG_BUF]; // Używamy MSG_BUF
+                        snprintf(formatted_msg, sizeof(formatted_msg), "[Server] %s", msg);
+
+                        // Użyj server_xsend_to_client na wypadek długiej wiadomości
+                        if (server_xsend_to_client(ser, server_pk, idx, (const unsigned char*)formatted_msg, strlen(formatted_msg)) == 0) {
                             printf("Sent to client %d\n", idx);
                         } else {
                             fprintf(stderr, "Failed to send to client %d\n", idx);
@@ -344,7 +345,13 @@ void interactive_loop_server(int ser, unsigned char server_pk[PK_LEN], unsigned 
 
             // default: send to client 0 if exists
             if (client_count > 0) {
-                if (server_send_to_client(ser, server_pk, 0, (const unsigned char*)line, strlen(line)) == 0) {
+                
+                // ZMIANA: Sformatuj wiadomość z nadawcą "Server"
+                char formatted_msg[MSG_BUF];
+                snprintf(formatted_msg, sizeof(formatted_msg), "[Server] %s", line);
+
+                // Użyj server_xsend_to_client
+                if (server_xsend_to_client(ser, server_pk, 0, (const unsigned char*)formatted_msg, strlen(formatted_msg)) == 0) {
                     printf("Sent to client 0\n");
                 } else {
                     fprintf(stderr, "Failed to send to client 0\n");
@@ -353,7 +360,7 @@ void interactive_loop_server(int ser, unsigned char server_pk[PK_LEN], unsigned 
                 printf("No clients connected\n");
             }
             printf("loracrypt-server> "); fflush(stdout);
-        }
+        } // koniec obsługi STDIN
 
         // serial
         if (FD_ISSET(ser, &rd)) {

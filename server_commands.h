@@ -45,7 +45,11 @@ void handle_client_message(int ser, const unsigned char server_pk[PK_LEN],
                            int client_idx, const unsigned char *msg, size_t msg_len);
 
 // Wysyłka do wszystkich zalogowanych
+/*void send_to_all(int ser, const unsigned char server_pk[PK_LEN],
+                 const unsigned char *msg, size_t msg_len);*/
+
 void send_to_all(int ser, const unsigned char server_pk[PK_LEN],
+                 int sender_idx, // DODANO: -1 dla serwera, >= 0 dla klienta
                  const unsigned char *msg, size_t msg_len);
 
 #ifdef __cplusplus
