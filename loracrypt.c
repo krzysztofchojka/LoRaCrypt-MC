@@ -46,6 +46,8 @@
 #define MAX_IN 512 // bufor wejściowy
 #define MSG_BUF 1024 // maks. długość wiadomości przychodzącej (już w server_commands.h)
 
+#define MAX_CONN_BUFFER (MAX_FRAME * 2)
+
 struct timeval ping_start;
 int waiting_for_pong = 0;
 
@@ -697,13 +699,114 @@ void interactive_loop_server(int ser_fd, int listen_fd, unsigned char server_pk[
 // być albo portem szeregowym, albo gniazdem TCP. Funkcje
 // read_all i write_all działają na obu.
 //
+//int logged_in = 0;
+
+/**
+ * @brief Przetwarza bufor wejściowy klienta, szuka pakietów,
+ * odszyfrowuje je i drukuje w oknie ncurses.
+ */
+void process_client_buffer(unsigned char *buffer, size_t *buffer_len, 
+                           unsigned char rx_key[SESSION_KEY_LEN],
+                           WINDOW *msg_win, WINDOW *input_win, char *input_buf)
+{
+    // Pętla przetwarzająca wszystkie kompletne pakiety w buforze
+    while (1) {
+        // Krok 1: Sprawdź nagłówek
+        if (*buffer_len < 2) {
+            return; // Za mało danych, czekaj
+        }
+        
+        uint16_t flen = ((uint16_t)buffer[0] << 8) | buffer[1];
+        size_t total_packet_len = 2 + flen;
+        
+        // Krok 2: Sprawdź, czy pakiet to nie śmieć (np. zły handshake)
+        if (flen == HANDSHAKE_HDR) {
+             fprintf(stderr, "Unexpected handshake received, discarding\n");
+             // Usuń śmieci z bufora
+             size_t handshake_len = 2 + HELLO_LEN + PK_LEN;
+             if (*buffer_len >= handshake_len) {
+                memmove(buffer, buffer + handshake_len, *buffer_len - handshake_len);
+                *buffer_len -= handshake_len;
+             } else {
+                 *buffer_len = 0; // Niekompletny, zresetuj
+             }
+             continue; // Spróbuj kolejny pakiet
+        }
+
+        // Sprawdź poprawność długości (jak w starym kodzie)
+        if (flen < PK_LEN + NONCE_LEN + MAC_LEN || flen > MAX_FRAME) {
+            //fprintf(stderr, "Invalid frame length %u, discarding buffer\n", flen);
+            *buffer_len = 0; // Zła długość, resetuj bufor
+            return;
+        }
+
+        // Krok 3: Sprawdź, czy mamy cały pakiet
+        if (*buffer_len < total_packet_len) {
+            return; // Niekompletny, czekaj na resztę
+        }
+
+        // Krok 4: Mamy cały pakiet. Przetwórz go.
+        unsigned char *sender_pk = buffer + 2; // (PK serwera, ale ignorujemy)
+        unsigned char *enc_buf = buffer + 2 + PK_LEN;
+        size_t enc_len = flen - PK_LEN;
+
+        unsigned char *nonce = enc_buf;
+        unsigned char *cipher = enc_buf + NONCE_LEN;
+        size_t clen = enc_len - NONCE_LEN;
+        unsigned char plain[MAX_PLAINTEXT+1];
+
+        // Spróbuj odszyfrować
+        if (crypto_secretbox_open_easy(plain, cipher, clen, nonce, rx_key) == 0) {
+            // SUKCES! To pakiet dla nas.
+            plain[clen - MAC_LEN] = 0;
+            
+            // Logika PING/PONG (zmienne globalne)
+            extern int waiting_for_pong;
+            extern struct timeval ping_start;
+
+            if (waiting_for_pong && strcasecmp((char*)plain, "pong") == 0) {
+                struct timeval ping_end;
+                gettimeofday(&ping_end, NULL);
+                long ms = (ping_end.tv_sec - ping_start.tv_sec) * 1000L +
+                        (ping_end.tv_usec - ping_start.tv_usec) / 1000L;
+                wprintw(msg_win, "Server responded \"%s\" RTT=%ld ms", plain, ms);
+                wrefresh(msg_win);
+                waiting_for_pong = 0;
+            } else {
+                // Zwykła wiadomość
+                wprintw(msg_win, "%s", plain);
+                wrefresh(msg_win);
+            }
+
+            // Odśwież input
+            werase(input_win);
+            mvwprintw(input_win, 0, 0, "loracrypt-client> %s", input_buf);
+            wrefresh(input_win);
+        } else {
+            // BŁĄD DESZYFROWANIA. 
+            // To był pakiet dla kogoś innego. Zignoruj go.
+            // (Można tu dodać logowanie błędu)
+            // fprintf(stderr, "Decrypt failed, ignoring packet\n");
+        }
+        
+        // Krok 5: Usuń przetworzony (lub zignorowany) pakiet z bufora
+        memmove(buffer, buffer + total_packet_len, *buffer_len - total_packet_len);
+        *buffer_len -= total_packet_len;
+        
+        // Pętla while(1) spróbuje teraz znaleźć kolejny pakiet w buforze
+
+    } // koniec while(1)
+}
+
+// ... (tutaj funkcja process_client_buffer) ...
+
 int logged_in = 0;
 void interactive_loop_client(int ser,
 unsigned char my_pk[PK_LEN], unsigned char my_sk[SK_LEN],
 unsigned char server_pk[PK_LEN],
 unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
 {
-    // ... (logika logowania - bez zmian) ...
+    // ... (cała logika logowania z 'read_all' - BEZ ZMIAN) ...
     if(!logged_in){
         char login[64], password[64], credentials[128];
         unsigned char nonce[NONCE_LEN];
@@ -742,14 +845,13 @@ unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
             if (read_all(ser, hdr_in, 2) != 2) { fprintf(stderr, "Read failed during login\n"); exit(1); }
             uint16_t flen_in = ((uint16_t)hdr_in[0]<<8) | hdr_in[1];
             
-            // Proste sprawdzanie flen_in
             if (flen_in < PK_LEN + NONCE_LEN + MAC_LEN || flen_in > MAX_FRAME) {
-                fprintf(stderr, "Invalid frame length during login: %u\n", flen_in);
+                //fprintf(stderr, "Invalid frame length during login: %u\n", flen_in);
                 continue;
             }
 
-            unsigned char sender_pk[PK_LEN];
-            if (read_all(ser, sender_pk, PK_LEN) != PK_LEN) { fprintf(stderr, "Short read sender pk\n"); exit(1); }
+            unsigned char sender_pk_in[PK_LEN];
+            if (read_all(ser, sender_pk_in, PK_LEN) != PK_LEN) { fprintf(stderr, "Short read sender pk\n"); exit(1); }
             
             unsigned char encbuf[MAX_FRAME];
             size_t enc_len = flen_in - PK_LEN;
@@ -770,6 +872,7 @@ unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
             }
         }
     }
+    
     // ... (inicjalizacja ncurses - bez zmian) ...
     initscr();
     cbreak();
@@ -792,9 +895,15 @@ unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
     wrefresh(input_win);
     wrefresh(msg_win);
     
-    // ... (główna pętla ncurses - bez zmian) ...
+    // --- NOWY BUFOR DLA PĘTLI GŁÓWNEJ ---
+    unsigned char input_buffer[MAX_CONN_BUFFER];
+    size_t input_buffer_len = 0;
+    
+    // --- ZMODYFIKOWANA GŁÓWNA PĘTLA ---
     while (1) {
-    wtimeout(input_win, 100);
+    
+    // --- 1) obsługa klawiatury (bez zmian) ---
+    wtimeout(input_win, 100); // Czekaj 100ms na klawisz
     int ch = wgetch(input_win);
     if (ch != ERR) {
         if (ch == KEY_UP) {
@@ -854,6 +963,7 @@ unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
                 uint16_t flen = PK_LEN + NONCE_LEN + in_len + MAC_LEN;
                 unsigned char hdr[2] = { (uint8_t)(flen>>8), (uint8_t)flen };
 
+                // Wysyłanie jest blokujące (write_all), co jest OK
                 write_all(ser, hdr, 2);
                 write_all(ser, my_pk, PK_LEN);
                 write_all(ser, ctext, flen - PK_LEN);
@@ -874,63 +984,68 @@ unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
             input_buf[in_len] = 0;
             history_pos = -1;
         }
+        // Odśwież widok wpisywania
         werase(input_win);
         mvwprintw(input_win, 0, 0, "loracrypt-client> %s", input_buf);
         wrefresh(input_win);
-    }
+    } // --- koniec obsługi klawiatury ---
 
-    // --- 2) obsługa przychodzącej ramki z serwera (bez zmian) ---
+
+    // --- 2) obsługa przychodzącej ramki z serwera (PRZEPISANA) ---
+    // Musimy sprawdzić, czy są dane, ale *bez blokowania* pętli
+    // (używamy select z zerowym timeoutem, tak jak było)
+    
     fd_set rd;
-    struct timeval tv = { 0, 0 };
+    struct timeval tv = { 0, 0 }; // Zerowy timeout = nie czekaj
     FD_ZERO(&rd);
     FD_SET(ser, &rd);
-    if (select(ser+1, &rd, NULL, NULL, &tv) > 0 && FD_ISSET(ser, &rd)) {
-        unsigned char hdr[2];
-        if (read_all(ser, hdr, 2) != 2) break;
-        uint16_t flen = (hdr[0]<<8) | hdr[1];
-        if (flen < PK_LEN + NONCE_LEN + MAC_LEN || flen > MAX_FRAME) {
-            unsigned char trash[256];
-            size_t togo = flen;
-            while (togo) {
-                size_t chunk = togo > sizeof(trash) ? sizeof(trash) : togo;
-                if(read_all(ser, trash, chunk) != (ssize_t)chunk) break;
-                togo -= chunk;
+    
+    // Sprawdź, czy są dane na porcie 'ser'
+    int sel_ret = select(ser+1, &rd, NULL, NULL, &tv);
+    
+    if (sel_ret > 0 && FD_ISSET(ser, &rd)) {
+        // Są dane! Czytaj je w sposób nieblokujący
+        unsigned char temp_buf[1024];
+        ssize_t r = read(ser, temp_buf, sizeof(temp_buf));
+        
+        if (r > 0) {
+            // Mamy dane, dodaj je do bufora
+            if (input_buffer_len + r > MAX_CONN_BUFFER) {
+                 fprintf(stderr, "Client input buffer overflow, discarding\n");
+                 input_buffer_len = 0;
+            } else {
+                memcpy(input_buffer + input_buffer_len, temp_buf, r);
+                input_buffer_len += r;
+                
+                // Próbuj przetworzyć bufor
+                process_client_buffer(input_buffer, &input_buffer_len, rx_key, 
+                                      msg_win, input_win, input_buf);
             }
-            continue;
+        } else if (r == 0) {
+            // EOF - serwer się rozłączył
+            wprintw(msg_win, "\n*** SERVER DISCONNECTED ***\n");
+            wrefresh(msg_win);
+            sleep(2);
+            break; // Zakończ pętlę klienta
+        } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            // Prawdziwy błąd odczytu
+            perror("read(client)");
+            sleep(2);
+            break; // Zakończ pętlę klienta
         }
-
-        unsigned char sender_pk[PK_LEN];
-        if (read_all(ser, sender_pk, PK_LEN) != PK_LEN) break;
-        unsigned char encbuf[MAX_FRAME];
-        size_t enc_len = flen - PK_LEN;
-        if(read_all(ser, encbuf, enc_len) != (ssize_t)enc_len) break;
-
-        unsigned char *nonce = encbuf;
-        unsigned char *cipher = encbuf + NONCE_LEN;
-        size_t clen = enc_len - NONCE_LEN;
-        unsigned char plain[MAX_PLAINTEXT+1];
-        if (crypto_secretbox_open_easy(plain, cipher, clen, nonce, rx_key) == 0) {
-            plain[clen - MAC_LEN] = 0;
-            
-            if (waiting_for_pong && strcasecmp((char*)plain, "pong") == 0) {
-                struct timeval ping_end;
-                gettimeofday(&ping_end, NULL);
-                long ms = (ping_end.tv_sec - ping_start.tv_sec) * 1000L +
-                        (ping_end.tv_usec - ping_start.tv_usec) / 1000L;
-                wprintw(msg_win, "Server responded \"%s\" RTT=%ld ms", plain, ms);
-                wrefresh(msg_win);
-                waiting_for_pong = 0;
-            }else{
-                wprintw(msg_win, "%s", plain);
-                wrefresh(msg_win);
-            }
-
-            werase(input_win);
-            mvwprintw(input_win, 0, 0, "loracrypt-client> %s", input_buf);
-            wrefresh(input_win);
-        }
+        // Jeśli r < 0 i (errno == EAGAIN), to nic nie rób,
+        // po prostu nie ma więcej danych (jeszcze).
+        
+    } else if (sel_ret < 0) {
+        perror("select(client)");
+        break; // Błąd select, zakończ
     }
-}
+    
+    // Pętla wraca do góry i znowu czeka na klawisz (w 'wgetch')
+    // Dzięki temu, że nie ma tu 'read_all', pętla nigdy się nie blokuje
+    // na dłużej niż 100ms (timeout z wgetch).
+
+} // --- Koniec głównej pętli while(1) ---
 
 // ... (sprzątanie ncurses - bez zmian) ...
 for (int i = 0; i < history_count; i++)
@@ -939,7 +1054,6 @@ delwin(msg_win);
 delwin(input_win);
 endwin();
 }
-
 
 // --- ZMODYFIKOWANA FUNKCJA main ---
 int main(int argc, char *argv[]) {
