@@ -220,9 +220,10 @@ ssize_t read_all(int fd, void *buf, size_t len) {
         if (r < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // W przypadku NONBLOCK (serial), poczekaj chwilę
-                // W przypadku BLOCKING (TCP), to nie powinno się zdarzyć
-                usleep(10000);
+                // W przypadku NONBLOCK (serial lub TCP), poczekaj chwilę
+                // To jest "hotfix" - lepsze byłoby pełne buforowanie,
+                // ale to wymagałoby dużej przebudowy.
+                usleep(1000); // <-- ZMIANA (z 10000)
                 continue;
             }
             return -1; // Prawdziwy błąd odczytu
@@ -265,6 +266,10 @@ int add_client(const unsigned char client_pk[PK_LEN],
             // Klient już istnieje, zaktualizujmy jego FD i typ
             clients[i].fd = fd;
             clients[i].type = type;
+            
+            // <-- ZMIANA: Zeruj bufor przy ponownym połączeniu
+            clients[i].input_buffer_len = 0; 
+            
             printf("Client %d re-authenticated (fd=%d, type=%d)\n", i, fd, type);
             return i;
         }
@@ -277,6 +282,9 @@ int add_client(const unsigned char client_pk[PK_LEN],
     clients[idx].type = type; // <-- ZAPISZ TYP
     clients[idx].logged_in = 0; // Domyślnie nie jest zalogowany
     memset(clients[idx].username, 0, sizeof(clients[idx].username));
+
+    // <-- ZMIANA: Zeruj bufor dla nowego klienta
+    clients[idx].input_buffer_len = 0;
 
     // wylicz sesyjne klucze (server role)
     if (crypto_kx_server_session_keys(clients[idx].rx_key, clients[idx].tx_key,
@@ -376,6 +384,9 @@ int handle_data_from_fd(int fd, const unsigned char server_pk[PK_LEN], const uns
     }
     if (read_len != 2) {
         fprintf(stderr, "FD %d short hdr read or error (%ld)\n", fd, read_len);
+        // Zwracamy -1, ale read_all z usleep(1000) powinno "wisieć"
+        // aż dostanie 2 bajty lub EOF.
+        // Jeśli read_all zwróciło < 2 (i nie 0), to błąd.
         return -1; // Błąd I/O
     }
     
@@ -632,8 +643,10 @@ void interactive_loop_server(int ser_fd, int listen_fd, unsigned char server_pk[
             } else {
                 printf("New TCP connection from %s:%d on fd %d\n",
                        inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port), new_fd);
-                // Ustaw gniazdo jako nieblokujące (opcjonalnie, ale 'read_all' sobie poradzi)
-                // fcntl(new_fd, F_SETFL, O_NONBLOCK); 
+                
+                // <-- KLUCZOWA ZMIANA: Ustaw gniazdo jako nieblokujące
+                fcntl(new_fd, F_SETFL, O_NONBLOCK); 
+                
                 tcp_client_fds[tcp_client_count++] = new_fd;
             }
         } // --- KONIEC OBSŁUGI NOWEGO POŁĄCZENIA ---

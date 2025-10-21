@@ -30,6 +30,8 @@ struct client_t {
     char username[64];
     int fd; // Deskryptor pliku (serial lub socket)
     enum client_type type; // Typ klienta
+    unsigned char input_buffer[MAX_FRAME * 2]; // Bufor na niekompletne pakiety
+    size_t input_buffer_len;
 };
 
 // Deklaracje globalnych zmiennych (zostaną zdefiniowane w server_commands.c)
