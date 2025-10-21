@@ -1,6 +1,6 @@
 // loracrypt.c
-// Multi-client LoRa+UART+TCP with libsodium
-// gcc loracrypt_multi.c server_commands.c -o loracrypt -lsodium -lncurses
+// Multi-client LoRa+UART+TCP with libsodium (NON-BLOCKING SERVER/CLIENT)
+// gcc loracrypt.c server_commands.c -o loracrypt -lsodium -lncurses
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,12 +28,8 @@
 #define NONCE_LEN crypto_secretbox_NONCEBYTES // 24
 #define MAC_LEN crypto_secretbox_MACBYTES // 16
 #define KEY_LEN crypto_secretbox_KEYBYTES // 32
-//#define PK_LEN crypto_kx_PUBLICKEYBYTES // 32 // Już w server_commands.h
-//#define SK_LEN crypto_kx_SECRETKEYBYTES // 32 // Już w server_commands.h
-//#define SESSION_KEY_LEN crypto_kx_SESSIONKEYBYTES // 32 // Już w server_commands.h
 
 #define MAX_FRAME 240
-//#define MAX_PLAINTEXT (MAX_FRAME - NONCE_LEN - MAC_LEN - PK_LEN) // Już w server_commands.h
 #define HELLO_MSG "HELLO test123"
 #define HELLO_LEN (sizeof(HELLO_MSG)-1)
 #define HANDSHAKE_HDR 0xFFFF
@@ -45,8 +41,9 @@
 // for ncurses
 #define MAX_IN 512 // bufor wejściowy
 #define MSG_BUF 1024 // maks. długość wiadomości przychodzącej (już w server_commands.h)
+// Maksymalny rozmiar bufora wejściowego dla pojedynczego połączenia (TCP lub LoRa)
+#define MAX_CONN_BUFFER (MAX_FRAME * 2) 
 
-#define MAX_CONN_BUFFER (MAX_FRAME * 2)
 
 struct timeval ping_start;
 int waiting_for_pong = 0;
@@ -102,119 +99,71 @@ int open_serial(const char *dev) {
 }
 
 // --- NOWE FUNKCJE SIECIOWE ---
+// (Funkcje open_server_socket, open_client_socket, is_network_address bez zmian)
 
-/**
- * @brief Sprawdza czy adres to "IP:PORT" i parsuje go.
- * @return 1 jeśli tak, 0 jeśli nie (traktować jak ścieżkę serial).
- */
 int is_network_address(const char *dev, char *ip_buf, size_t ip_buf_len, int *port_buf) {
     char *colon = strrchr(dev, ':');
-    if (!colon) return 0; // Brak portu, to nie adres IP:PORT
-
+    if (!colon) return 0; 
     int port = atoi(colon + 1);
-    if (port <= 0 || port > 65535) return 0; // Nieprawidłowy port
-
-    // Sprawdź, czy część przed portem to IP lub hostname
-    // Prosta heurystyka: jeśli zawiera '/' lub '.', ale nie tylko '.', to pewnie ścieżka
+    if (port <= 0 || port > 65535) return 0; 
     if (strchr(dev, '/') != NULL) return 0; 
-    
-    // Sprawdź, czy część "IP" nie jest pusta
     if (colon == dev) return 0;
-
-    // Skopiuj część IP
     size_t ip_len = colon - dev;
-    if (ip_len >= ip_buf_len) return 0; // Bufor IP za mały
-    
+    if (ip_len >= ip_buf_len) return 0; 
     memcpy(ip_buf, dev, ip_len);
     ip_buf[ip_len] = '\0';
-    
     *port_buf = port;
     return 1;
 }
 
-/**
- * @brief Otwiera gniazdo nasłuchujące serwera.
- */
 int open_server_socket(const char *ip, int port) {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) {
-        perror("socket");
-        exit(1);
-    }
-
+    if (listen_fd < 0) { perror("socket"); exit(1); }
     int optval = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-
     struct sockaddr_in serv_addr;
     memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(port);
-    
     if (strcmp(ip, "0.0.0.0") == 0) {
         serv_addr.sin_addr.s_addr = INADDR_ANY;
     } else if (inet_pton(AF_INET, ip, &serv_addr.sin_addr) <= 0) {
-        // Spróbuj rozwiązać hostname
         struct hostent *he = gethostbyname(ip);
-        if (he == NULL) {
-            herror("gethostbyname");
-            exit(1);
-        }
+        if (he == NULL) { herror("gethostbyname"); exit(1); }
         memcpy(&serv_addr.sin_addr, he->h_addr_list[0], he->h_length);
     }
-
-
     if (bind(listen_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("bind");
-        exit(1);
+        perror("bind"); exit(1);
     }
-
-    if (listen(listen_fd, 10) < 0) {
-        perror("listen");
-        exit(1);
-    }
+    if (listen(listen_fd, 10) < 0) { perror("listen"); exit(1); }
     printf("Server listening on %s:%d (fd %d)\n", ip, port, listen_fd);
     return listen_fd;
 }
 
-/**
- * @brief Otwiera gniazdo klienta i łączy się z serwerem.
- */
 int open_client_socket(const char *ip, int port) {
     int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_fd < 0) {
-        perror("socket");
-        exit(1);
-    }
-
+    if (sock_fd < 0) { perror("socket"); exit(1); }
     struct sockaddr_in serv_addr;
     memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(port);
-
     if (inet_pton(AF_INET, ip, &serv_addr.sin_addr) <= 0) {
-        // Spróbuj rozwiązać hostname
         struct hostent *he = gethostbyname(ip);
-        if (he == NULL) {
-            herror("gethostbyname");
-            fprintf(stderr, "Could not resolve hostname: %s\n", ip);
-            exit(1);
-        }
+        if (he == NULL) { herror("gethostbyname"); fprintf(stderr, "Could not resolve hostname: %s\n", ip); exit(1); }
         memcpy(&serv_addr.sin_addr, he->h_addr_list[0], he->h_length);
         printf("Resolved %s to %s\n", ip, inet_ntoa(*(struct in_addr*)he->h_addr_list[0]));
     }
-
     if (connect(sock_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("connect");
-        exit(1);
+        perror("connect"); exit(1);
     }
     printf("Connected to %s:%d (fd %d)\n", ip, port, sock_fd);
     return sock_fd;
 }
-
 // ------------------------------
 
 
-// Dokładnie czyta len bajtów
+// Ta funkcja jest używana TYLKO przez klienta (do logowania) i do zapisu.
+// Główna pętla serwera i klienta NIE UŻYWA jej do odczytu.
 ssize_t read_all(int fd, void *buf, size_t len) {
     size_t total = 0;
     while (total < len) {
@@ -222,10 +171,8 @@ ssize_t read_all(int fd, void *buf, size_t len) {
         if (r < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // W przypadku NONBLOCK (serial lub TCP), poczekaj chwilę
-                // To jest "hotfix" - lepsze byłoby pełne buforowanie,
-                // ale to wymagałoby dużej przebudowy.
-                usleep(1000); // <-- ZMIANA (z 10000)
+                // To jest OK tylko dla sekwencji blokującej (login klienta)
+                usleep(10000); 
                 continue;
             }
             return -1; // Prawdziwy błąd odczytu
@@ -258,7 +205,7 @@ extern struct client_t clients[MAX_CLIENTS];
 extern int client_count;
 
 // Dodaj klienta (jeśli nie ma) i zwróć indeks lub -1
-// --- ZMODYFIKOWANA SYGNATURA ---
+// --- ZMODYFIKOWANA --- (Usunięto `input_buffer_len`)
 int add_client(const unsigned char client_pk[PK_LEN],
                const unsigned char server_pk[PK_LEN], const unsigned char server_sk[SK_LEN],
                int fd, enum client_type type) {
@@ -268,10 +215,7 @@ int add_client(const unsigned char client_pk[PK_LEN],
             // Klient już istnieje, zaktualizujmy jego FD i typ
             clients[i].fd = fd;
             clients[i].type = type;
-            
-            // <-- ZMIANA: Zeruj bufor przy ponownym połączeniu
-            clients[i].input_buffer_len = 0; 
-            
+            // (Usunięto zerowanie bufora - bufor jest teraz powiązany z fd, nie z client_t)
             printf("Client %d re-authenticated (fd=%d, type=%d)\n", i, fd, type);
             return i;
         }
@@ -280,13 +224,11 @@ int add_client(const unsigned char client_pk[PK_LEN],
 
     int idx = client_count; // Nowy indeks
     memcpy(clients[idx].pk, client_pk, PK_LEN);
-    clients[idx].fd = fd; // <-- ZAPISZ FD
-    clients[idx].type = type; // <-- ZAPISZ TYP
-    clients[idx].logged_in = 0; // Domyślnie nie jest zalogowany
+    clients[idx].fd = fd; 
+    clients[idx].type = type; 
+    clients[idx].logged_in = 0; 
     memset(clients[idx].username, 0, sizeof(clients[idx].username));
-
-    // <-- ZMIANA: Zeruj bufor dla nowego klienta
-    clients[idx].input_buffer_len = 0;
+    // (Usunięto zerowanie bufora)
 
     // wylicz sesyjne klucze (server role)
     if (crypto_kx_server_session_keys(clients[idx].rx_key, clients[idx].tx_key,
@@ -310,7 +252,7 @@ int find_client_by_pk(const unsigned char pk[PK_LEN]) {
     return -1;
 }
 
-// HANDSHAKE (klient) - bez zmian, używa przekazanego 'ser' (który może być socketem)
+// HANDSHAKE (klient) - bez zmian
 void handshake_client(int ser,
     unsigned char my_pk[PK_LEN], unsigned char my_sk[SK_LEN],
     unsigned char server_pk[PK_LEN],
@@ -336,190 +278,185 @@ void handshake_client(int ser,
     printf("Session keys computed (client)\n");
 }
 
-// Handshake handler na serwerze
-// --- ZMODYFIKOWANA SYGNATURA ---
-int handle_handshake_on_server(int fd, const unsigned char server_pk[PK_LEN], const unsigned char server_sk[SK_LEN], enum client_type type) {
-    unsigned char hello[HELLO_LEN+1];
-    // Używamy 'fd' zamiast 'ser'
-    if (read_all(fd, hello, HELLO_LEN) != HELLO_LEN) {
-        fprintf(stderr, "Short read HELLO during handshake on fd %d\n", fd);
-        return -1;
-    }
-    hello[HELLO_LEN]=0;
-    if (strncmp((char*)hello, HELLO_MSG, HELLO_LEN) != 0) {
-        fprintf(stderr, "Bad HELLO content during handshake on fd %d: %s\n", fd, hello);
-    }
-    unsigned char client_pk[PK_LEN];
-    if (read_all(fd, client_pk, PK_LEN) != PK_LEN) {
-        fprintf(stderr, "Reading client PK failed in handshake on fd %d\n", fd);
-        return -1;
-    }
-    if (write_all(fd, server_pk, PK_LEN) != PK_LEN) {
-        fprintf(stderr, "Sending server PK failed in handshake on fd %d\n", fd);
-        return -1;
-    }
-    
-    // --- ZMODYFIKOWANE WYWOŁANIE ---
-    int idx = add_client(client_pk, server_pk, (unsigned char*)server_sk, fd, type);
-    
-    if (idx < 0) {
-        fprintf(stderr, "Failed to add client (limit?) from fd %d\n", fd);
-        return -1;
-    }
-    printf("Handshake complete for fd %d, client idx=%d\n", fd, idx);
-    return idx;
-}
 
+// ------------------------------------------------------------------
+// --- NOWA LOGIKA SERWERA (ZASTĘPUJE handle_data_from_fd) ---
+// ------------------------------------------------------------------
 
-// --- NOWA FUNKCJA DO OBSŁUGI DANYCH Z DOWOLNEGO FD ---
 /**
- * @brief Przetwarza dane przychodzące na danym FD (serial lub TCP).
- * @return 0 w przypadku powodzenia, -1 jeśli klient się rozłączył lub wystąpił błąd I/O.
+ * @brief Przetwarza dane zgromadzone w buforze (TCP lub LoRa).
+ * Szuka kompletnych pakietów (handshake lub danych),
+ * przetwarza je i usuwa z bufora.
+ * @param buffer Wskaźnik do bufora danych (np. lora_buffer lub conn->buffer)
+ * @param buffer_len Wskaźnik do długości danych w buforze (zostanie zaktualizowany)
+ * @param fd Deskryptor pliku, z którego dane pochodzą (dla logowania i wysyłania odp.)
+ * @param type Typ połączenia (CLIENT_LORA lub CLIENT_TCP)
+ * @param server_pk Klucz publiczny serwera
+ * @param server_sk Klucz prywatny serwera
  */
-int handle_data_from_fd(int fd, const unsigned char server_pk[PK_LEN], const unsigned char server_sk[SK_LEN], enum client_type type) {
-    unsigned char hdr[2];
-    ssize_t read_len = read_all(fd, hdr, 2);
-    
-    if (read_len == 0) {
-        fprintf(stderr, "FD %d closed connection (EOF)\n", fd);
-        return -1; // Klient się rozłączył
-    }
-    if (read_len != 2) {
-        fprintf(stderr, "FD %d short hdr read or error (%ld)\n", fd, read_len);
-        // Zwracamy -1, ale read_all z usleep(1000) powinno "wisieć"
-        // aż dostanie 2 bajty lub EOF.
-        // Jeśli read_all zwróciło < 2 (i nie 0), to błąd.
-        return -1; // Błąd I/O
-    }
-    
-    uint16_t flen = ((uint16_t)hdr[0]<<8) | hdr[1];
-    
-    // --- HANDSHAKE ---
-    if (flen == HANDSHAKE_HDR) {
-        if (handle_handshake_on_server(fd, server_pk, server_sk, type) < 0) {
-            fprintf(stderr, "Handshake failed on fd %d\n", fd);
-            // Nie zwracamy -1, błąd handshake nie oznacza rozłączenia
+void process_data_buffer(unsigned char *buffer, size_t *buffer_len, int fd, enum client_type type,
+                         const unsigned char server_pk[PK_LEN], const unsigned char server_sk[SK_LEN]) 
+{
+    // Pętla przetwarzająca wszystkie kompletne pakiety znalezione w buforze
+    while (1) {
+        
+        // --- KROK 1: Sprawdź, czy mamy wystarczająco danych na nagłówek ---
+        if (*buffer_len < 2) {
+            // Za mało danych nawet na nagłówek, wyjdź i czekaj na resztę
+            return;
         }
-        printf("loracrypt-server> "); fflush(stdout);
-        return 0; // Obsłużono
-    }
-    
-    if (flen == 0 || flen > MAX_FRAME) {
-        fprintf(stderr, "Frame too big (%u) on fd %d, discarding\n", flen, fd);
-        size_t togo = flen;
-        unsigned char trash[128];
-        while (togo) {
-            size_t chunk = togo > sizeof(trash) ? sizeof(trash) : togo;
-            if (read_all(fd, trash, chunk) != (ssize_t)chunk) return -1; // Błąd podczas czyszczenia
-            togo -= chunk;
-        }
-        printf("loracrypt-server> "); fflush(stdout);
-        return 0;
-    }
-    
-    if (flen < PK_LEN + NONCE_LEN + MAC_LEN) {
-        fprintf(stderr, "Frame too small on fd %d\n", fd);
-        // read and drop flen
-        unsigned char trash[256];
-        size_t togo = flen;
-        while (togo) {
-            size_t chunk = togo > sizeof(trash) ? sizeof(trash) : togo;
-            if (read_all(fd, trash, chunk) != (ssize_t)chunk) return -1;
-            togo -= chunk;
-        }
-        printf("loracrypt-server> "); fflush(stdout);
-        return 0;
-    }
-    
-    // --- NORMALNY PAKIET DANYCH ---
-    unsigned char sender_pk[PK_LEN];
-    if (read_all(fd, sender_pk, PK_LEN) != PK_LEN) {
-        fprintf(stderr, "Short read sender pk on fd %d\n", fd); return -1;
-    }
-    
-    unsigned char buf[MAX_FRAME];
-    size_t enc_len = flen - PK_LEN;
-    if (enc_len > sizeof(buf)) {
-        fprintf(stderr, "enc_len too big on fd %d\n", fd); return -1;
-    }
-    if (read_all(fd, buf, enc_len) != (ssize_t)enc_len) {
-        fprintf(stderr, "Short read enc payload on fd %d\n", fd); return -1;
-    }
-    
-    int idx = find_client_by_pk(sender_pk);
-    if (idx < 0) {
-        fprintf(stderr, "Unknown sender pk from fd %d, ignoring (run handshake)\n", fd);
-        printf("loracrypt-server> "); fflush(stdout);
-        return 0;
-    }
-    
-    // --- WAŻNA AKTUALIZACJA ---
-    // Mamy klienta. Zaktualizujmy jego FD i typ na ten, z którego przyszła wiadomość.
-    // Dzięki temu odpowiedzi będą kierowane na właściwy socket TCP.
-    if (clients[idx].fd != fd) {
-         printf("Client %d (%s) FD updated from %d to %d (type %d)\n", 
-                idx, clients[idx].username, clients[idx].fd, fd, type);
-    }
-    clients[idx].fd = fd;
-    clients[idx].type = type;
+        
+        uint16_t flen = ((uint16_t)buffer[0] << 8) | buffer[1];
+        size_t total_packet_len = 0;
+        
+        // --- KROK 2: Ustal oczekiwaną długość pakietu ---
+        if (flen == HANDSHAKE_HDR) {
+            // --- PRZYPADEK HANDSHAKE ---
+            total_packet_len = 2 + HELLO_LEN + PK_LEN;
 
-    // --- ODSZYFROWYWANIE ---
-    unsigned char *nonce = buf;
-    unsigned char *cipher = buf + NONCE_LEN;
-    size_t clen = enc_len - NONCE_LEN;
-    unsigned char plain[MAX_PLAINTEXT+1];
-    if (crypto_secretbox_open_easy(plain, cipher, clen, nonce, clients[idx].rx_key) != 0) {
-        fprintf(stderr, "Decrypt failed from client %d (fd %d)\n", idx, fd);
-        printf("loracrypt-server> "); fflush(stdout);
-        return 0;
-    }
-    size_t plen2 = clen - MAC_LEN;
-    plain[plen2] = 0;
-    printf("\n[From client %d on fd %d] %s\n", idx, fd, (char*)plain);
-
-    // --- LOGIKA LOGOWANIA ---
-    if (!clients[idx].logged_in) {
-        if (strncmp((char*)plain, "LOGIN ", 6) == 0) {
-            char login[64], pass[64];
-            if (sscanf((char*)plain + 6, "%63s %63s", login, pass) == 2) {
-                if (check_credentials(login, pass)) {
-                    clients[idx].logged_in = 1;
-                    strncpy(clients[idx].username, login, sizeof(clients[idx].username)-1);
-                    // ZMODYFIKOWANE WYWOŁANIE (bez 'fd')
-                    server_send_to_client(server_pk, idx, (unsigned char*)"LOGIN OK", 8);
-                    printf("Client %d (fd %d) logged in as %s\n", idx, fd, login);
-                } else {
-                    server_send_to_client(server_pk, idx, (unsigned char*)"LOGIN FAIL", 10);
-                    printf("Client %d (fd %d) failed login\n", idx, fd);
-                }
-            } else {
-                server_send_to_client(server_pk, idx, (unsigned char*)"BAD FORMAT", 10);
+            // Sprawdź, czy mamy cały pakiet w buforze
+            if (*buffer_len < total_packet_len) {
+                return; // Niekompletny, czekaj
             }
-        } else {
-            server_send_to_client(server_pk, idx, (unsigned char*)"LOGIN REQUIRED", 14);
-            printf("Client %d (fd %d) tried to send before login\n", idx, fd);
-        }
-        printf("loracrypt-server> "); fflush(stdout);
-        return 0; // Koniec obsługi
-    }
 
-    // --- PRZEKAZANIE DO LOGIKI APLIKACJI ---
-    // ZMODYFIKOWANE WYWOŁANIE (bez 'fd')
-    handle_client_message(server_pk, idx, plain, strlen((char*)plain));
-    printf("loracrypt-server> "); fflush(stdout);
-    
-    return 0; // Sukces
+            // Mamy kompletny pakiet handshake. Przetwórz go.
+            unsigned char *hello = buffer + 2;
+            unsigned char *client_pk = buffer + 2 + HELLO_LEN;
+
+            if (strncmp((char*)hello, HELLO_MSG, HELLO_LEN) != 0) {
+                fprintf(stderr, "Bad HELLO content during handshake on fd %d\n", fd);
+            } else {
+                // Wyślij odpowiedź (Server PK)
+                if (write_all(fd, server_pk, PK_LEN) != PK_LEN) {
+                    fprintf(stderr, "Sending server PK failed in handshake on fd %d\n", fd);
+                } else {
+                    // Zarejestruj klienta
+                    int idx = add_client(client_pk, server_pk, server_sk, fd, type);
+                    if (idx < 0) {
+                        fprintf(stderr, "Failed to add client (limit?) from fd %d\n", fd);
+                    } else {
+                        printf("Handshake complete for fd %d, client idx=%d\n", fd, idx);
+                    }
+                }
+            }
+            printf("loracrypt-server> "); fflush(stdout);
+
+        } else {
+            // --- PRZYPADEK PAKIETU DANYCH ---
+            
+            // *** KRYTYCZNA POPRAWKA ***
+            // Sprawdź poprawność długości, ZANIM spróbujesz czytać
+            if (flen == 0 || flen > MAX_FRAME || flen < PK_LEN + NONCE_LEN + MAC_LEN) {
+                fprintf(stderr, "Frame invalid len (%u) on fd %d, discarding ENTIRE buffer to resync\n", flen, fd);
+                // To jest desynchronizacja. Najbezpieczniej jest wyczyścić cały bufor.
+                *buffer_len = 0; 
+                return; // Zakończ przetwarzanie, czekaj na nowe, czyste dane
+            }
+
+            total_packet_len = 2 + flen;
+
+            // Sprawdź, czy mamy cały pakiet w buforze
+            if (*buffer_len < total_packet_len) {
+                // Mamy nagłówek, ale pakiet jest niekompletny
+                return; // Wyjdź i czekaj na resztę danych
+            }
+
+            // Mamy kompletny pakiet danych. Przetwórz go.
+            unsigned char *sender_pk = buffer + 2;
+            unsigned char *enc_buf = buffer + 2 + PK_LEN; // (nonce + cipher)
+            size_t enc_len = flen - PK_LEN;
+            
+            int idx = find_client_by_pk(sender_pk);
+            if (idx < 0) {
+                fprintf(stderr, "Unknown sender pk from fd %d, ignoring (run handshake)\n", fd);
+            
+            } else {
+                // Mamy klienta. Zaktualizujmy jego FD i typ.
+                if (clients[idx].fd != fd) {
+                     printf("Client %d (%s) FD updated from %d to %d (type %d)\n", 
+                            idx, clients[idx].username, clients[idx].fd, fd, type);
+                }
+                clients[idx].fd = fd;
+                clients[idx].type = type;
+
+                // --- ODSZYFROWYWANIE ---
+                unsigned char *nonce = enc_buf;
+                unsigned char *cipher = enc_buf + NONCE_LEN;
+                size_t clen = enc_len - NONCE_LEN;
+                unsigned char plain[MAX_PLAINTEXT+1];
+                
+                if (crypto_secretbox_open_easy(plain, cipher, clen, nonce, clients[idx].rx_key) != 0) {
+                    fprintf(stderr, "Decrypt failed from client %d (fd %d)\n", idx, fd);
+                
+                } else {
+                    size_t plen2 = clen - MAC_LEN;
+                    plain[plen2] = 0;
+                    printf("\n[From client %d on fd %d] %s\n", idx, fd, (char*)plain);
+
+                    // --- LOGIKA LOGOWANIA ---
+                    if (!clients[idx].logged_in) {
+                        if (strncmp((char*)plain, "LOGIN ", 6) == 0) {
+                            char login[64], pass[64];
+                            if (sscanf((char*)plain + 6, "%63s %63s", login, pass) == 2) {
+                                if (check_credentials(login, pass)) {
+                                    clients[idx].logged_in = 1;
+                                    strncpy(clients[idx].username, login, sizeof(clients[idx].username)-1);
+                                    server_send_to_client(server_pk, idx, (unsigned char*)"LOGIN OK", 8);
+                                    printf("Client %d (fd %d) logged in as %s\n", idx, fd, login);
+                                } else {
+                                    server_send_to_client(server_pk, idx, (unsigned char*)"LOGIN FAIL", 10);
+                                    printf("Client %d (fd %d) failed login\n", idx, fd);
+                                }
+                            } else {
+                                server_send_to_client(server_pk, idx, (unsigned char*)"BAD FORMAT", 10);
+                            }
+                        } else {
+                            server_send_to_client(server_pk, idx, (unsigned char*)"LOGIN REQUIRED", 14);
+                            printf("Client %d (fd %d) tried to send before login\n", idx, fd);
+                        }
+                    
+                    } else {
+                        // --- PRZEKAZANIE DO LOGIKI APLIKACJI ---
+                        handle_client_message(server_pk, idx, plain, strlen((char*)plain));
+                    }
+                } // koniec udanego deszyfrowania
+                printf("loracrypt-server> "); fflush(stdout);
+            } // koniec 'else' (znaleziono klienta)
+        } // koniec 'else' (pakiet danych)
+
+        // --- KROK 5: Usuń przetworzony pakiet z bufora ---
+        // (Jeśli doszło do błędu desynchronizacji, 'return' wyżej zapobiegł temu)
+        memmove(buffer, buffer + total_packet_len, *buffer_len - total_packet_len);
+        *buffer_len -= total_packet_len;
+        
+        // Pętla 'while(1)' spróbuje teraz przetworzyć kolejny pakiet,
+        // który mógł być "sklejony" z poprzednim w buforze.
+        
+    } // koniec while(1)
 }
 
 
 // --- CAŁKOWICIE PRZEPISANA PĘTLA SERWERA ---
+
+// Struktura do zarządzania połączeniami TCP i ich buforami
+struct tcp_conn {
+    int fd;
+    unsigned char buffer[MAX_CONN_BUFFER];
+    size_t buffer_len;
+};
+
+
 void interactive_loop_server(int ser_fd, int listen_fd, unsigned char server_pk[PK_LEN], unsigned char server_sk[SK_LEN]) {
     fd_set rd;
     char line[512];
     
-    // Tablica na deskryptory połączonych klientów TCP
-    int tcp_client_fds[MAX_CLIENTS];
-    int tcp_client_count = 0;
+    // Tablica na aktywne połączenia TCP
+    struct tcp_conn tcp_connections[MAX_CLIENTS];
+    int tcp_conn_count = 0;
+    
+    // Bufor dla portu szeregowego
+    unsigned char lora_buffer[MAX_CONN_BUFFER];
+    size_t lora_buffer_len = 0;
     
     // Zerowanie FD we wszystkich klientach (na start)
     for(int i=0; i < MAX_CLIENTS; i++) {
@@ -549,9 +486,9 @@ void interactive_loop_server(int ser_fd, int listen_fd, unsigned char server_pk[
             if (listen_fd > max_fd) max_fd = listen_fd;
         }
         // 3. Dodaj wszystkich połączonych klientów TCP
-        for (int i = 0; i < tcp_client_count; i++) {
-            FD_SET(tcp_client_fds[i], &rd);
-            if (tcp_client_fds[i] > max_fd) max_fd = tcp_client_fds[i];
+        for (int i = 0; i < tcp_conn_count; i++) {
+            FD_SET(tcp_connections[i].fd, &rd);
+            if (tcp_connections[i].fd > max_fd) max_fd = tcp_connections[i].fd;
         }
 
         if (select(max_fd + 1, &rd, NULL, NULL, NULL) < 0) {
@@ -562,6 +499,7 @@ void interactive_loop_server(int ser_fd, int listen_fd, unsigned char server_pk[
 
         // --- OBSŁUGA STDIN (KONSOLA SERWERA) ---
         if (FD_ISSET(STDIN_FILENO, &rd)) {
+            // (Ta sekcja jest bez zmian)
             if (!fgets(line, sizeof(line), stdin)) break;
             size_t plen = strlen(line);
             if (plen && line[plen-1]=='\n') line[--plen]=0;
@@ -583,7 +521,6 @@ void interactive_loop_server(int ser_fd, int listen_fd, unsigned char server_pk[
             
             if (strncmp(line, "/sendall ", 9) == 0) {
                 const char *msg = line + 9;
-                // ZMODYFIKOWANE WYWOŁANIE (bez 'ser_fd')
                 send_to_all(server_pk, -1, (const unsigned char*)msg, strlen(msg));
                 printf("Sent to all (%d clients)\n", client_count);
                 printf("loracrypt-server> "); fflush(stdout);
@@ -598,7 +535,6 @@ void interactive_loop_server(int ser_fd, int listen_fd, unsigned char server_pk[
                     if (idx >= 0 && idx < client_count && *msg) {
                         char formatted_msg[MSG_BUF];
                         snprintf(formatted_msg, sizeof(formatted_msg), "\n[Server] %s", msg);
-                        // ZMODYFIKOWANE WYWOŁANIE (bez 'ser_fd')
                         if (server_xsend_to_client(server_pk, idx, (const unsigned char*)formatted_msg, strlen(formatted_msg)) == 0) {
                             printf("Sent to client %d\n", idx);
                         } else {
@@ -618,7 +554,6 @@ void interactive_loop_server(int ser_fd, int listen_fd, unsigned char server_pk[
             if (client_count > 0) {
                 char formatted_msg[MSG_BUF];
                 snprintf(formatted_msg, sizeof(formatted_msg), "\n[Server] %s", line);
-                // ZMODYFIKOWANE WYWOŁANIE (bez 'ser_fd')
                 if (server_xsend_to_client(server_pk, 0, (const unsigned char*)formatted_msg, strlen(formatted_msg)) == 0) {
                     printf("Sent to client 0\n");
                 } else {
@@ -639,40 +574,84 @@ void interactive_loop_server(int ser_fd, int listen_fd, unsigned char server_pk[
             
             if (new_fd < 0) {
                 perror("accept");
-            } else if (tcp_client_count >= MAX_CLIENTS) {
+            } else if (tcp_conn_count >= MAX_CLIENTS) {
                 fprintf(stderr, "Max TCP clients reached, rejecting fd %d\n", new_fd);
                 close(new_fd); // Odrzuć połączenie
             } else {
                 printf("New TCP connection from %s:%d on fd %d\n",
                        inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port), new_fd);
                 
-                // <-- KLUCZOWA ZMIANA: Ustaw gniazdo jako nieblokujące
+                // Ustaw gniazdo jako nieblokujące
                 fcntl(new_fd, F_SETFL, O_NONBLOCK); 
                 
-                tcp_client_fds[tcp_client_count++] = new_fd;
+                // Dodaj do naszej tablicy połączeń
+                tcp_connections[tcp_conn_count].fd = new_fd;
+                tcp_connections[tcp_conn_count].buffer_len = 0;
+                tcp_conn_count++;
             }
         } // --- KONIEC OBSŁUGI NOWEGO POŁĄCZENIA ---
 
 
         // --- OBSŁUGA DANYCH Z PORTU SZEREGOWEGO ---
         if (ser_fd != -1 && FD_ISSET(ser_fd, &rd)) {
-            // Wywołaj handler; nie przejmujemy się błędem, bo ser_fd i tak nie zamykamy
-            handle_data_from_fd(ser_fd, server_pk, server_sk, CLIENT_LORA);
+            unsigned char temp_buf[1024];
+            // Czytaj NIEBLOKUJĄCO
+            ssize_t r = read(ser_fd, temp_buf, sizeof(temp_buf));
+            
+            if (r > 0) {
+                // Mamy dane. Dodaj do bufora LoRa.
+                if (lora_buffer_len + r > MAX_CONN_BUFFER) {
+                    fprintf(stderr, "LoRa buffer overflow, discarding data\n");
+                    lora_buffer_len = 0; // Zresetuj bufor
+                } else {
+                    memcpy(lora_buffer + lora_buffer_len, temp_buf, r);
+                    lora_buffer_len += r;
+                    // Próbuj przetworzyć pakiety z bufora
+                    process_data_buffer(lora_buffer, &lora_buffer_len, ser_fd, CLIENT_LORA, server_pk, server_sk);
+                }
+            } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                perror("read(ser_fd)");
+                // (Nie robimy nic, port szeregowy zostaje otwarty)
+            }
         } // --- KONIEC OBSŁUGI SERIALA ---
 
 
         // --- OBSŁUGA DANYCH OD KLIENTÓW TCP ---
-        for (int i = 0; i < tcp_client_count; i++) {
-            int cfd = tcp_client_fds[i];
-            if (FD_ISSET(cfd, &rd)) {
-                // Wywołaj handler. Jeśli zwróci -1, klient się rozłączył.
-                if (handle_data_from_fd(cfd, server_pk, server_sk, CLIENT_TCP) < 0) {
-                    printf("TCP client on fd %d disconnected\n", cfd);
-                    close(cfd);
+        for (int i = 0; i < tcp_conn_count; i++) {
+            struct tcp_conn *conn = &tcp_connections[i];
+            
+            if (FD_ISSET(conn->fd, &rd)) {
+                unsigned char temp_buf[1024];
+                // Czytaj NIEBLOKUJĄCO
+                ssize_t r = read(conn->fd, temp_buf, sizeof(temp_buf));
+                
+                if (r > 0) {
+                    // Mamy dane. Dodaj do bufora tego klienta.
+                    if (conn->buffer_len + r > MAX_CONN_BUFFER) {
+                        fprintf(stderr, "TCP client fd %d buffer overflow, disconnecting\n", conn->fd);
+                        r = 0; // Traktuj jak rozłączenie
+                    } else {
+                        memcpy(conn->buffer + conn->buffer_len, temp_buf, r);
+                        conn->buffer_len += r;
+                        // Próbuj przetworzyć pakiety z bufora
+                        process_data_buffer(conn->buffer, &conn->buffer_len, conn->fd, CLIENT_TCP, server_pk, server_sk);
+                    }
+                }
+                
+                if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                    // r == 0 -> EOF (Klient się rozłączył)
+                    // r < 0 -> Błąd odczytu
+                    if (r == 0) {
+                        printf("TCP client on fd %d disconnected (EOF)\n", conn->fd);
+                    } else {
+                        perror("read(tcp_fd)");
+                    }
+                    
+                    close(conn->fd);
                     
                     // Znajdź klienta (jeśli był zahandshake'owany) i oznacz jako nieaktywny
                     for (int k = 0; k < client_count; k++) {
-                        if (clients[k].fd == cfd) {
+                        if (clients[k].fd == conn->fd) {
                             printf("Client %d (%s) marked as disconnected.\n", k, clients[k].username);
                             clients[k].fd = -1; // Oznacz jako nieaktywny
                             clients[k].logged_in = 0; // Wyloguj
@@ -680,11 +659,9 @@ void interactive_loop_server(int ser_fd, int listen_fd, unsigned char server_pk[
                         }
                     }
                     
-                    // Usuń FD z tablicy monitorowanych
-                    for (int j = i; j < tcp_client_count - 1; j++) {
-                        tcp_client_fds[j] = tcp_client_fds[j+1];
-                    }
-                    tcp_client_count--;
+                    // Usuń połączenie z tablicy (przez nadpisanie ostatnim)
+                    tcp_connections[i] = tcp_connections[tcp_conn_count - 1];
+                    tcp_conn_count--;
                     i--; // Popraw licznik pętli
                 }
             }
@@ -693,13 +670,9 @@ void interactive_loop_server(int ser_fd, int listen_fd, unsigned char server_pk[
 } // --- KONIEC interactive_loop_server ---
 
 
-//
-// Pętla klienta (interactive_loop_client) pozostaje BEZ ZMIAN.
-// Używa ona 'ser' jako opaque deskryptora, który teraz może
-// być albo portem szeregowym, albo gniazdem TCP. Funkcje
-// read_all i write_all działają na obu.
-//
-//int logged_in = 0;
+// ------------------------------------------------------------------
+// --- NOWA LOGIKA KLIENTA (Z POPRAWKAMI) ---
+// ------------------------------------------------------------------
 
 /**
  * @brief Przetwarza bufor wejściowy klienta, szuka pakietów,
@@ -717,7 +690,6 @@ void process_client_buffer(unsigned char *buffer, size_t *buffer_len,
         }
         
         uint16_t flen = ((uint16_t)buffer[0] << 8) | buffer[1];
-        size_t total_packet_len = 2 + flen;
         
         // Krok 2: Sprawdź, czy pakiet to nie śmieć (np. zły handshake)
         if (flen == HANDSHAKE_HDR) {
@@ -734,11 +706,13 @@ void process_client_buffer(unsigned char *buffer, size_t *buffer_len,
         }
 
         // Sprawdź poprawność długości (jak w starym kodzie)
-        if (flen < PK_LEN + NONCE_LEN + MAC_LEN || flen > MAX_FRAME) {
+        if (flen == 0 || flen < PK_LEN + NONCE_LEN + MAC_LEN || flen > MAX_FRAME) {
             //fprintf(stderr, "Invalid frame length %u, discarding buffer\n", flen);
             *buffer_len = 0; // Zła długość, resetuj bufor
             return;
         }
+
+        size_t total_packet_len = 2 + flen;
 
         // Krok 3: Sprawdź, czy mamy cały pakiet
         if (*buffer_len < total_packet_len) {
@@ -746,7 +720,7 @@ void process_client_buffer(unsigned char *buffer, size_t *buffer_len,
         }
 
         // Krok 4: Mamy cały pakiet. Przetwórz go.
-        unsigned char *sender_pk = buffer + 2; // (PK serwera, ale ignorujemy)
+        // unsigned char *sender_pk = buffer + 2; // (PK serwera, ale ignorujemy)
         unsigned char *enc_buf = buffer + 2 + PK_LEN;
         size_t enc_len = flen - PK_LEN;
 
@@ -798,7 +772,6 @@ void process_client_buffer(unsigned char *buffer, size_t *buffer_len,
     } // koniec while(1)
 }
 
-// ... (tutaj funkcja process_client_buffer) ...
 
 int logged_in = 0;
 void interactive_loop_client(int ser,
@@ -806,7 +779,7 @@ unsigned char my_pk[PK_LEN], unsigned char my_sk[SK_LEN],
 unsigned char server_pk[PK_LEN],
 unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
 {
-    // ... (cała logika logowania z 'read_all' - BEZ ZMIAN) ...
+    // --- Sekcja logowania (używa blokującego read_all) ---
     if(!logged_in){
         char login[64], password[64], credentials[128];
         unsigned char nonce[NONCE_LEN];
@@ -840,13 +813,13 @@ unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
                 exit(1);
             }
 
-            // odbiór odpowiedzi
+            // odbiór odpowiedzi (blokujący)
             unsigned char hdr_in[2];
             if (read_all(ser, hdr_in, 2) != 2) { fprintf(stderr, "Read failed during login\n"); exit(1); }
             uint16_t flen_in = ((uint16_t)hdr_in[0]<<8) | hdr_in[1];
             
             if (flen_in < PK_LEN + NONCE_LEN + MAC_LEN || flen_in > MAX_FRAME) {
-                //fprintf(stderr, "Invalid frame length during login: %u\n", flen_in);
+                fprintf(stderr, "Invalid frame length during login: %u\n", flen_in);
                 continue;
             }
 
@@ -873,7 +846,7 @@ unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
         }
     }
     
-    // ... (inicjalizacja ncurses - bez zmian) ...
+    // --- Inicjalizacja Ncurses ---
     initscr();
     cbreak();
     noecho();
@@ -899,10 +872,10 @@ unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
     unsigned char input_buffer[MAX_CONN_BUFFER];
     size_t input_buffer_len = 0;
     
-    // --- ZMODYFIKOWANA GŁÓWNA PĘTLA ---
+    // --- ZMODYFIKOWANA GŁÓWNA PĘTLA (NIEBLOKUJĄCA) ---
     while (1) {
     
-    // --- 1) obsługa klawiatury (bez zmian) ---
+    // --- 1) obsługa klawiatury ---
     wtimeout(input_win, 100); // Czekaj 100ms na klawisz
     int ch = wgetch(input_win);
     if (ch != ERR) {
@@ -991,16 +964,12 @@ unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
     } // --- koniec obsługi klawiatury ---
 
 
-    // --- 2) obsługa przychodzącej ramki z serwera (PRZEPISANA) ---
-    // Musimy sprawdzić, czy są dane, ale *bez blokowania* pętli
-    // (używamy select z zerowym timeoutem, tak jak było)
-    
+    // --- 2) obsługa przychodzącej ramki z serwera (NIEBLOKUJĄCA) ---
     fd_set rd;
     struct timeval tv = { 0, 0 }; // Zerowy timeout = nie czekaj
     FD_ZERO(&rd);
     FD_SET(ser, &rd);
     
-    // Sprawdź, czy są dane na porcie 'ser'
     int sel_ret = select(ser+1, &rd, NULL, NULL, &tv);
     
     if (sel_ret > 0 && FD_ISSET(ser, &rd)) {
@@ -1033,21 +1002,15 @@ unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
             sleep(2);
             break; // Zakończ pętlę klienta
         }
-        // Jeśli r < 0 i (errno == EAGAIN), to nic nie rób,
-        // po prostu nie ma więcej danych (jeszcze).
         
     } else if (sel_ret < 0) {
         perror("select(client)");
         break; // Błąd select, zakończ
     }
-    
-    // Pętla wraca do góry i znowu czeka na klawisz (w 'wgetch')
-    // Dzięki temu, że nie ma tu 'read_all', pętla nigdy się nie blokuje
-    // na dłużej niż 100ms (timeout z wgetch).
 
 } // --- Koniec głównej pętli while(1) ---
 
-// ... (sprzątanie ncurses - bez zmian) ...
+// --- Sprzątanie Ncurses ---
 for (int i = 0; i < history_count; i++)
     free(history[i]);
 delwin(msg_win);
@@ -1055,7 +1018,8 @@ delwin(input_win);
 endwin();
 }
 
-// --- ZMODYFIKOWANA FUNKCJA main ---
+
+// --- FUNKCJA main ---
 int main(int argc, char *argv[]) {
     if (argc != 3 || (argv[1][1] != 's' && argv[1][1] != 'c')) {
         fprintf(stderr,
@@ -1110,14 +1074,15 @@ int main(int argc, char *argv[]) {
         for (int i=0;i<PK_LEN;i++) printf("%02x", my_pk[i]);
         printf("\n");
         
-        // Wywołaj nową pętlę serwera
+        // Wywołaj NOWĄ, nieblokującą pętlę serwera
         interactive_loop_server(main_fd, listen_fd, my_pk, my_sk);
         
     } else {
         printf("*** RUNNING AS CLIENT ***\n");
-        // Pętlę klienta wywołujemy jak dawniej, z 'main_fd' (serial lub socket)
+        // Pętla klienta (handshake jest blokujący, reszta nie)
         handshake_client(main_fd, my_pk, my_sk, peer_pk, rx_key, tx_key);
         printf("Gotowy do komunikacji zaszyfrowanej!\n");
+        // Wywołaj NOWĄ, nieblokującą pętlę klienta
         interactive_loop_client(main_fd, my_pk, my_sk, peer_pk, rx_key, tx_key);
     }
 
