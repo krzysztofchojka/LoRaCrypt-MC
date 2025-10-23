@@ -775,6 +775,65 @@ void process_client_buffer(unsigned char *buffer, size_t *buffer_len,
 
 
 int logged_in = 0;
+
+/**
+ * Reads a password from stdin without echoing the characters.
+ * Prints asterisks (*) for each character.
+ * Handles backspace.
+ */
+void get_password(char *password, int size) {
+    struct termios old_settings, new_settings;
+    int c;
+    int i = 0;
+
+    // 1. Get current terminal settings
+    if (tcgetattr(STDIN_FILENO, &old_settings) != 0) {
+        perror("tcgetattr");
+        // Handle error, maybe exit
+        return;
+    }
+
+    new_settings = old_settings;
+
+    // 2. Disable canonical mode and echo
+    new_settings.c_lflag &= ~(ECHO | ICANON);
+
+    // 3. Apply new settings immediately
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &new_settings) != 0) {
+        perror("tcsetattr");
+        // Handle error
+        return;
+    }
+
+    // --- Read characters one by one ---
+    while (i < size - 1) {
+        c = getchar(); // Read one character
+
+        if (c == '\n' || c == '\r') {
+            // Enter key pressed
+            break;
+        } else if ((c == 127 || c == 8) && i > 0) {
+            // Backspace (127) or Delete (8) key
+            i--;
+            printf("\b \b"); // Move cursor back, overwrite with space, move back again
+            fflush(stdout);
+        } else if (c >= 32 && c <= 126) {
+            // Printable character
+            password[i] = (char)c;
+            printf("*");
+            fflush(stdout);
+            i++;
+        }
+        // Ignore other control characters
+    }
+
+    password[i] = '\0'; // Null-terminate the string
+    printf("\n");       // Move to the next line (since Enter wasn't echoed)
+
+    // 4. Restore original terminal settings
+    tcsetattr(STDIN_FILENO, TCSANOW, &old_settings);
+}
+
 void interactive_loop_client(int ser,
 unsigned char my_pk[PK_LEN], unsigned char my_sk[SK_LEN],
 unsigned char server_pk[PK_LEN],
@@ -794,8 +853,7 @@ unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
 
             printf("Password: ");
             fflush(stdout);
-            if (!fgets(password, sizeof(password), stdin)) exit(1);
-            password[strcspn(password, "\n")] = 0;
+            get_password(password, sizeof(password));
 
             snprintf(credentials, sizeof(credentials), "LOGIN %s %s", login, password);
 
@@ -851,6 +909,7 @@ unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
                 printf("❌ Logowanie nieudane: %s\n", plain);
             }
         }
+    
     }
     
     // --- Inicjalizacja Ncurses ---
