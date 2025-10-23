@@ -64,9 +64,9 @@ Requirements:
 - Installed **libsodium** library  
 - GCC compiler  
 
-Compile:
+Build:
 ```bash
-gcc loracrypt_mc.c -o loracrypt-mc -lsodium
+./build.sh
 ```
 
 ---
@@ -75,18 +75,18 @@ gcc loracrypt_mc.c -o loracrypt-mc -lsodium
 
 #### Server mode:
 ```bash
-./loracrypt-mc -s /dev/ttyUSB0 115200
+./loracrypt -s /dev/ttyUSB0 115200
 ```
 ```bash
-./loracrypt-mc -s 127.0.0.1:5000
+./loracrypt -s 127.0.0.1:5000
 ```
 
 #### Client mode:
 ```bash
-./loracrypt-mc -c /dev/ttyUSB0 115200
+./loracrypt -c /dev/ttyUSB0 115200
 ```
 ```bash
-./loracrypt-mc -c 127.0.0.1:5000
+./loracrypt -c 127.0.0.1:5000
 ```
 
 ---
