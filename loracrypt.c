@@ -980,22 +980,33 @@ unsigned char rx_key[SESSION_KEY_LEN], unsigned char tx_key[SESSION_KEY_LEN])
     
     if (sel_ret > 0 && FD_ISSET(ser, &rd)) {
         // Są dane! Czytaj je w sposób nieblokujący
-        unsigned char temp_buf[1024];
-        ssize_t r = read(ser, temp_buf, sizeof(temp_buf));
+        //unsigned char temp_buf[1024];
+        //ssize_t r = read(ser, temp_buf, sizeof(temp_buf));
+        size_t space_left = MAX_CONN_BUFFER - input_buffer_len;
+        if (space_left == 0) {
+            // Bufor jest pełny, a process_client_buffer go nie opróżnił
+            // (może czeka na resztę pakietu, który jest > MAX_CONN_BUFFER)
+            fprintf(stderr, "Client input buffer full, logic error or packet too large\n");
+            input_buffer_len = 0; // Zresetuj, aby uniknąć pętli
+            space_left = MAX_CONN_BUFFER;
+        }
+    
+        ssize_t r = read(ser, input_buffer + input_buffer_len, space_left);
         
         if (r > 0) {
             // Mamy dane, dodaj je do bufora
-            if (input_buffer_len + r > MAX_CONN_BUFFER) {
+            /*if (input_buffer_len + r > MAX_CONN_BUFFER) {
                  fprintf(stderr, "Client input buffer overflow, discarding\n");
                  input_buffer_len = 0;
             } else {
                 memcpy(input_buffer + input_buffer_len, temp_buf, r);
+                input_buffer_len += r;*/
                 input_buffer_len += r;
                 
                 // Próbuj przetworzyć bufor
                 process_client_buffer(input_buffer, &input_buffer_len, rx_key, 
                                       msg_win, input_win, input_buf);
-            }
+            //}
         } else if (r == 0) {
             // EOF - serwer się rozłączył
             wprintw(msg_win, "\n*** SERVER DISCONNECTED ***\n");
