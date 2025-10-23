@@ -34,7 +34,7 @@
 #define HELLO_LEN (sizeof(HELLO_MSG)-1)
 #define HANDSHAKE_HDR 0xFFFF
 #define MAX_CLIENTS 32
-#define BAUDRATE B115200
+//#define BAUDRATE B115200
 
 #define MAX_HISTORY 100
 
@@ -44,6 +44,7 @@
 // Maksymalny rozmiar bufora wejściowego dla pojedynczego połączenia (TCP lub LoRa)
 #define MAX_CONN_BUFFER (MAX_FRAME * 2) 
 
+int BAUDRATE = B115200;
 
 struct timeval ping_start;
 int waiting_for_pong = 0;
@@ -1038,11 +1039,11 @@ endwin();
 
 // --- FUNKCJA main ---
 int main(int argc, char *argv[]) {
-    if (argc != 3 || (argv[1][1] != 's' && argv[1][1] != 'c')) {
+    if ((argc != 3 && argc != 4) || (argv[1][1] != 's' && argv[1][1] != 'c')) {
         fprintf(stderr,
             "Usage: %s -s|-c <device_or_IP:PORT>\n"
             " -s server mode, -c client mode\n"
-            " Example (Serial): %s -s /dev/tty.usbserial\n"
+            " Example (Serial): %s -s /dev/tty.usbserial <baudrate>\n"
             " Example (Network):  %s -c 127.0.0.1:5000\n", 
             argv[0], argv[0], argv[0]);
         return 1;
@@ -1060,6 +1061,22 @@ int main(int argc, char *argv[]) {
     
     int main_fd = -1; // Dla klienta lub serwera serial
     int listen_fd = -1; // Dla serwera TCP
+
+    if (argc == 4) {
+        // Czwarty argument jest dozwolony tylko w trybie serwera (-s)
+        // (zgodnie z Twoim komunikatem Usage)
+        printf("Baudrate usera: %s", argv[3]);
+            char *endptr; // Do sprawdzania błędów konwersji
+            
+            // Konwertuj tekst z argv[3] na liczbę (long)
+            BAUDRATE = strtol(argv[3], &endptr, 10);
+            
+            // Sprawdź, czy konwersja się udała i czy podano poprawną liczbę
+            if (*endptr != '\0' || BAUDRATE <= 0) {
+                fprintf(stderr, "Błędna lub niepoprawna wartość baudrate: %s\n", argv[3]);
+                return 1;
+            }
+    }
     
     // Sprawdź czy to adres sieciowy
     if (is_network_address(dev_or_addr, ip_buf, sizeof(ip_buf), &port)) {

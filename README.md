@@ -75,12 +75,18 @@ gcc loracrypt_mc.c -o loracrypt-mc -lsodium
 
 #### Server mode:
 ```bash
-./loracrypt-mc -s /dev/ttyUSB0
+./loracrypt-mc -s /dev/ttyUSB0 115200
+```
+```bash
+./loracrypt-mc -s 127.0.0.1:5000
 ```
 
 #### Client mode:
 ```bash
-./loracrypt-mc -c /dev/ttyUSB0
+./loracrypt-mc -c /dev/ttyUSB0 115200
+```
+```bash
+./loracrypt-mc -c 127.0.0.1:5000
 ```
 
 ---
